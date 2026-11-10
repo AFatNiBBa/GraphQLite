@@ -76,12 +76,10 @@ internal static class Functions
                 {
                     if (v.IsNull) return Value.Null;
                     if (v.Kind != ValueKind.Node) throw Err("labels", $"expected a node, got {v.Kind}");
-                    var store = ctx.Store;
-                    if (!store.NodeAlive(v.EntityId)) return Value.EmptyList;
-                    var ls = store.Nodes[v.EntityId].Labels;
-                    if (ls is null) return Value.EmptyList;
+                    var ls = ctx.Store.NodeLabels(v.EntityId);
+                    if (ls.Length == 0) return Value.EmptyList;
                     var r = new Value[ls.Length];
-                    for (int i = 0; i < ls.Length; i++) r[i] = Value.FromString(store.Labels.Name(ls[i]));
+                    for (int i = 0; i < ls.Length; i++) r[i] = Value.FromString(ctx.Store.Labels.Name(ls[i]));
                     return Value.FromList(r);
                 });
             case "type":
@@ -89,7 +87,7 @@ internal static class Functions
                 {
                     if (v.IsNull) return Value.Null;
                     if (v.Kind != ValueKind.Relationship) throw Err("type", $"expected a relationship, got {v.Kind}");
-                    return Value.FromString(ctx.Store.RelTypes.Name(ctx.Store.Rels[v.EntityId].Type));
+                    return Value.FromString(ctx.Store.RelTypes.Name(ctx.Store.RelInfo(v.EntityId).Type));
                 });
             case "keys":
                 return F1(name, a, (ctx, v) =>
@@ -101,9 +99,7 @@ internal static class Functions
                         case ValueKind.Node:
                         case ValueKind.Relationship:
                             {
-                                var p = v.Kind == ValueKind.Node ? ctx.Store.Nodes[v.EntityId].Props : ctx.Store.Rels[v.EntityId].Props;
-                                if (p is null) return Value.EmptyList;
-                                var keys = p.Keys;
+                                var keys = ctx.Store.PropKeysOf(v.Kind == ValueKind.Node ? ctx.Store.NodePropsAddr(v.EntityId) : ctx.Store.RelPropsAddr(v.EntityId));
                                 var r = new Value[keys.Length];
                                 for (int i = 0; i < keys.Length; i++) r[i] = Value.FromString(ctx.Store.PropKeys.Name(keys[i]));
                                 return Value.FromList(r);
@@ -116,17 +112,186 @@ internal static class Functions
                 {
                     ValueKind.Null => Value.Null,
                     ValueKind.Map => v,
-                    ValueKind.Node => Value.FromMap(ctx.Store.PropsToMap(ctx.Store.NodeAlive(v.EntityId) ? ctx.Store.Nodes[v.EntityId].Props : null)),
-                    ValueKind.Relationship => Value.FromMap(ctx.Store.PropsToMap(ctx.Store.Rels[v.EntityId].Props)),
+                    ValueKind.Node => Value.FromMap(ctx.Store.PropsDict(ctx.Store.NodePropsAddr(v.EntityId))),
+                    ValueKind.Relationship => Value.FromMap(ctx.Store.PropsDict(ctx.Store.RelPropsAddr(v.EntityId))),
                     _ => throw Err("properties", $"expected node, relationship or map, got {v.Kind}"),
                 });
             case "startnode":
-                return F1(name, a, (ctx, v) => v.Kind == ValueKind.Relationship ? Value.FromNodeId(ctx.Store.Rels[v.EntityId].Src)
+                return F1(name, a, (ctx, v) => v.Kind == ValueKind.Relationship ? Value.FromNodeId(ctx.Store.RelInfo(v.EntityId).Src)
                     : v.IsNull ? Value.Null : throw Err("startNode", "expected a relationship"));
             case "endnode":
-                return F1(name, a, (ctx, v) => v.Kind == ValueKind.Relationship ? Value.FromNodeId(ctx.Store.Rels[v.EntityId].Dst)
+                return F1(name, a, (ctx, v) => v.Kind == ValueKind.Relationship ? Value.FromNodeId(ctx.Store.RelInfo(v.EntityId).Dst)
                     : v.IsNull ? Value.Null : throw Err("endNode", "expected a relationship"));
-            case "nodes":
+            case "degree":
+                return F1(name, a, (ctx, v) =>
+                {
+                    if (v.IsNull) return Value.Null;
+                    var (o, i) = ctx.Store.Degree(v.EntityId);
+                    return Value.FromInt(o + i);
+                });
+
+            // ------------------------------------------------ temporal
+            case "date":
+            case "localtime":
+            case "time":
+            case "localdatetime":
+            case "datetime":
+            case "date.realtime":
+            case "date.statement":
+            case "date.transaction":
+            case "localtime.realtime":
+            case "localtime.statement":
+            case "localtime.transaction":
+            case "time.realtime":
+            case "time.statement":
+            case "time.transaction":
+            case "localdatetime.realtime":
+            case "localdatetime.statement":
+            case "localdatetime.transaction":
+            case "datetime.realtime":
+            case "datetime.statement":
+            case "datetime.transaction":
+                {
+                    Arity(name, a, 0, 1);
+                    string kind = name.Split('.')[0];
+                    if (name.Contains('.'))
+                    {
+                        // the optional argument is a time zone
+                        var tzArg = a.Length > 0 ? a[0] : null;
+                        return ctx =>
+                        {
+                            var now = Temporal.Construct("datetime", []);
+                            if (tzArg is null) return kind == "datetime" ? now : Temporal.Convert(kind, now, null);
+                            var zoned = Value.FromZonedUtc(now.Num, ZoneInfo.FromName(tzArg(ctx).AsString()));
+                            return kind == "datetime" ? zoned : Temporal.Convert(kind, zoned, null);
+                        };
+                    }
+                    var args = a;
+                    return ctx => Temporal.Construct(kind, args.Length == 0 ? [] : [args[0](ctx)]);
+                }
+            case "date.truncate":
+            case "localtime.truncate":
+            case "time.truncate":
+            case "localdatetime.truncate":
+            case "datetime.truncate":
+                {
+                    Arity(name, a, 2, 3);
+                    string kind = name.Split('.')[0];
+                    var unit = a[0];
+                    var val = a[1];
+                    return ctx =>
+                    {
+                        var u = unit(ctx);
+                        var v = val(ctx);
+                        return u.IsNull || v.IsNull ? Value.Null : Temporal.Truncate(kind, u.AsString(), v);
+                    };
+                }
+            case "datetime.fromepoch":
+                {
+                    Arity(name, a, 1, 2);
+                    var s = a[0];
+                    var ns = a.Length > 1 ? a[1] : null;
+                    return ctx => Temporal.Construct("datetime", [Value.FromMap(new Dictionary<string, Value>
+                    {
+                        ["epochSeconds"] = s(ctx),
+                        ["nanosecond"] = ns is null ? Value.FromInt(0) : ns(ctx),
+                    })]);
+                }
+            case "datetime.fromepochmillis":
+                return F1(name, a, (ctx, v) => Temporal.Construct("datetime", [Value.FromMap(new Dictionary<string, Value> { ["epochMillis"] = v })]));
+            case "duration":
+                return F1(name, a, (ctx, v) => Temporal.ConstructDuration(v));
+            case "duration.between":
+            case "duration.inmonths":
+            case "duration.indays":
+            case "duration.inseconds":
+                {
+                    Arity(name, a, 2, 2);
+                    string unit = name switch
+                    {
+                        "duration.inmonths" => "months",
+                        "duration.indays" => "days",
+                        "duration.inseconds" => "seconds",
+                        _ => "between",
+                    };
+                    var x = a[0];
+                    var y = a[1];
+                    return ctx => Temporal.Between(x(ctx), y(ctx), unit);
+                }
+
+            // ------------------------------------------------ spatial
+            case "point":
+                return F1(name, a, (ctx, v) => Temporal.MakePoint(v));
+            case "point.distance":
+            case "distance":
+                {
+                    Arity(name, a, 2, 2);
+                    var x = a[0];
+                    var y = a[1];
+                    return ctx =>
+                    {
+                        var p = x(ctx);
+                        var q = y(ctx);
+                        if (p.IsNull || q.IsNull) return Value.Null;
+                        double d = p.AsPoint().DistanceTo(q.AsPoint());
+                        return double.IsNaN(d) ? Value.Null : Value.FromFloat(d);
+                    };
+                }
+            case "point.withinbbox":
+                {
+                    Arity(name, a, 3, 3);
+                    var pe = a[0];
+                    var lo = a[1];
+                    var hi = a[2];
+                    return ctx =>
+                    {
+                        var p = pe(ctx);
+                        var l = lo(ctx);
+                        var h = hi(ctx);
+                        if (p.IsNull || l.IsNull || h.IsNull) return Value.Null;
+                        var pp = p.AsPoint();
+                        var lp = l.AsPoint();
+                        var hp = h.AsPoint();
+                        if (pp.Srid != lp.Srid || pp.Srid != hp.Srid) return Value.Null;
+                        return Value.FromBool(pp.X >= lp.X && pp.X <= hp.X && pp.Y >= lp.Y && pp.Y <= hp.Y);
+                    };
+                }
+
+            // ------------------------------------------------ json
+            case "tojson":
+            case "json.stringify":
+            case "apoc.convert.tojson":
+                return F1(name, a, (ctx, v) =>
+                {
+                    var mat = new QueryResult.Materializer(ctx.Store);
+                    return Value.FromString(mat.Convert(v).ToJson());
+                });
+            case "fromjson":
+            case "json.parse":
+            case "apoc.convert.fromjsonmap":
+            case "apoc.convert.fromjsonlist":
+                return F1(name, a, (ctx, v) => v.IsNull ? Value.Null : Value.FromJson(v.AsString()));
+            case "valuetype":
+                return F1(name, a, (ctx, v) => Value.FromString(v.Kind switch
+                {
+                    ValueKind.Null => "NULL",
+                    ValueKind.Boolean => "BOOLEAN",
+                    ValueKind.Integer => "INTEGER",
+                    ValueKind.Float => "FLOAT",
+                    ValueKind.String => "STRING",
+                    ValueKind.List => "LIST<ANY>",
+                    ValueKind.Map => "MAP",
+                    ValueKind.Node => "NODE",
+                    ValueKind.Relationship => "RELATIONSHIP",
+                    ValueKind.Path => "PATH",
+                    ValueKind.Date => "DATE",
+                    ValueKind.LocalTime => "LOCAL TIME",
+                    ValueKind.Time => "ZONED TIME",
+                    ValueKind.LocalDateTime => "LOCAL DATETIME",
+                    ValueKind.DateTime => "ZONED DATETIME",
+                    ValueKind.Duration => "DURATION",
+                    _ => "POINT",
+                }));            case "nodes":
                 return F1(name, a, (ctx, v) => v.Kind == ValueKind.Path
                     ? Value.FromList(((GraphPath)v.Obj!).NodeIds.Select(Value.FromNodeId).ToArray())
                     : v.IsNull ? Value.Null : throw Err("nodes", "expected a path"));
@@ -399,7 +564,14 @@ internal static class Functions
         "tointeger", "toint", "tointegerornull", "tofloat", "tofloatornull", "tostring", "tostringornull", "toboolean", "tobooleanornull",
         "toupper", "upper", "tolower", "lower", "trim", "ltrim", "rtrim", "char_length", "character_length", "substring", "left", "right",
         "replace", "split", "abs", "sign", "ceil", "floor", "round", "sqrt", "exp", "log", "log10", "sin", "cos", "tan", "cot", "asin",
-        "acos", "atan", "degrees", "radians", "atan2",
+        "acos", "atan", "degrees", "radians", "atan2", "degree",
+        "date", "localtime", "time", "localdatetime", "datetime", "date.realtime", "date.statement", "date.transaction",
+        "localtime.realtime", "localtime.statement", "localtime.transaction", "time.realtime", "time.statement", "time.transaction",
+        "localdatetime.realtime", "localdatetime.statement", "localdatetime.transaction", "datetime.realtime", "datetime.statement",
+        "datetime.transaction", "date.truncate", "localtime.truncate", "time.truncate", "localdatetime.truncate", "datetime.truncate",
+        "datetime.fromepoch", "datetime.fromepochmillis", "duration", "duration.between", "duration.inmonths", "duration.indays",
+        "duration.inseconds", "point", "point.distance", "distance", "point.withinbbox", "tojson", "json.stringify", "apoc.convert.tojson",
+        "fromjson", "json.parse", "apoc.convert.fromjsonmap", "apoc.convert.fromjsonlist", "valuetype",
     ];
 
     public static Value ToInteger(in Value v, bool strict)
@@ -454,6 +626,14 @@ internal static class Functions
             case ValueKind.Float:
             case ValueKind.Boolean:
                 return Value.FromString(v.ToDisplayString());
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+            case ValueKind.Time:
+            case ValueKind.LocalDateTime:
+            case ValueKind.DateTime:
+            case ValueKind.Duration:
+            case ValueKind.Point:
+                return Value.FromString(Temporal.Format(v));
             default:
                 if (strict) throw Err("toString", $"cannot convert {v.Kind}");
                 return Value.Null;

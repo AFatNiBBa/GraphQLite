@@ -222,7 +222,25 @@ internal sealed class Parser
             return new DeleteClause(ParseExprList(), true);
         }
         if (AcceptKw("DELETE")) return new DeleteClause(ParseExprList(), false);
-        if (AcceptKw("CALL")) return ParseCall();
+        if (AcceptKw("CALL")) return Is(TokKind.LBrace) || Is(TokKind.LParen) ? ParseSubquery() : ParseCall();
+        if (IsKw("LOAD") && IsKw(1, "CSV"))
+        {
+            Advance();
+            Advance();
+            bool headers = false;
+            if (AcceptKw("WITH"))
+            {
+                ExpectKw("HEADERS");
+                headers = true;
+            }
+            ExpectKw("FROM");
+            var url = ParseExpr();
+            ExpectKw("AS");
+            var v = ExpectName();
+            string? ft = null;
+            if (AcceptKw("FIELDTERMINATOR")) ft = Expect(TokKind.String, "string").Text;
+            return new LoadCsvClause(headers, url, v, ft);
+        }
         if (AcceptKw("FOREACH")) return ParseForeach();
         return null;
     }
@@ -258,6 +276,7 @@ internal sealed class Parser
             var target = ParsePostfix();
             if (target is LabelCheckExpr lc)
             {
+                if (lc.Expression != null) throw Error("Only plain labels can be set");
                 items.Add(new SetItem(SetKind.Labels, lc.Target, null, null, lc.Labels));
                 continue;
             }
@@ -281,7 +300,7 @@ internal sealed class Parser
         do
         {
             var target = ParsePostfix();
-            if (target is LabelCheckExpr lc) items.Add(new SetItem(SetKind.Labels, lc.Target, null, null, lc.Labels));
+            if (target is LabelCheckExpr { Expression: null } lc) items.Add(new SetItem(SetKind.Labels, lc.Target, null, null, lc.Labels));
             else if (target is PropertyExpr pe) items.Add(new SetItem(SetKind.Property, pe.Target, pe.Key, null, null));
             else throw Error("Invalid REMOVE item");
         } while (Accept(TokKind.Comma));
@@ -317,6 +336,39 @@ internal sealed class Parser
             if (AcceptKw("WHERE")) where = ParseExpr();
         }
         return new CallClause(name.ToLowerInvariant(), args, yields, where);
+    }
+
+    private SubqueryClause ParseSubquery()
+    {
+        List<string>? imports = null;
+        bool all = false;
+        if (Accept(TokKind.LParen))
+        {
+            imports = new List<string>();
+            if (Accept(TokKind.Star)) all = true;
+            else if (!Is(TokKind.RParen))
+            {
+                do imports.Add(ExpectName()); while (Accept(TokKind.Comma));
+            }
+            Expect(TokKind.RParen, "')'");
+        }
+        Expect(TokKind.LBrace, "'{'");
+        var q = ParseQuery();
+        Expect(TokKind.RBrace, "'}'");
+        bool inTx = false;
+        Expr? batch = null;
+        if (IsKw("IN") && IsKw(1, "TRANSACTIONS"))
+        {
+            Advance();
+            Advance();
+            inTx = true;
+            if (AcceptKw("OF"))
+            {
+                batch = ParseExpr();
+                if (!AcceptKw("ROWS")) AcceptKw("ROW");
+            }
+        }
+        return new SubqueryClause(q, imports, all, inTx, batch);
     }
 
     private ForeachClause ParseForeach()
@@ -430,16 +482,72 @@ internal sealed class Parser
         string? v = null;
         if (Is(TokKind.Ident)) v = Advance().Text;
         var labels = new List<string>();
-        while (Accept(TokKind.Colon))
+        List<string>? any = null;
+        LabelExpression? residual = null;
+        if (Accept(TokKind.Colon))
         {
-            labels.Add(SchemaName());
-            while (Accept(TokKind.Pipe) || Accept(TokKind.Colon)) labels.Add(SchemaName()); // treat A|B / A:B as conjunction
+            int saved = _noPipe;
+            _noPipe = 0;
+            var le = ParseLabelOr();
+            _noPipe = saved;
+            foreach (var term in le.Conjuncts)
+            {
+                if (term is LabelName n) { if (!labels.Contains(n.Name)) labels.Add(n.Name); }
+                else if (any is null && term is LabelOr o && o.Names() is { } names) any = names;
+                else residual = residual is null ? term : new LabelAnd(residual, term);
+            }
         }
         Expr? props = null;
         if (Is(TokKind.LBrace)) props = ParseMapLiteral();
         else if (Is(TokKind.Param)) { int s = _p; var t = Advance(); props = Mark(s, new ParamExpr(t.Text)); }
         Expect(TokKind.RParen, "')'");
-        return new NodePattern(v, labels, props);
+        return new NodePattern(v, labels, props) { AnyLabels = any, Residual = residual };
+    }
+
+    // ------------------------------------------------------------------ label expressions
+
+    /// <summary>When &gt; 0 a '|' ends a label expression (inside list comprehensions '|' starts the projection).</summary>
+    private int _noPipe;
+
+    private bool IsLabelAtomStart(Tok t) => t.Kind is TokKind.Ident or TokKind.LParen or TokKind.Bang or TokKind.Percent;
+
+    private LabelExpression ParseLabelOr()
+    {
+        var l = ParseLabelAnd();
+        while (_noPipe == 0 && Is(TokKind.Pipe) && IsLabelAtomStart(PeekTok()) || Is(TokKind.Pipe) && PeekTok().Kind == TokKind.Colon && _noPipe == 0)
+        {
+            Advance();
+            Accept(TokKind.Colon);
+            l = new LabelOr(l, ParseLabelAnd());
+        }
+        return l;
+    }
+
+    private LabelExpression ParseLabelAnd()
+    {
+        var l = ParseLabelNot();
+        while ((Is(TokKind.Amp) || Is(TokKind.Colon)) && IsLabelAtomStart(PeekTok()))
+        {
+            Advance();
+            l = new LabelAnd(l, ParseLabelNot());
+        }
+        return l;
+    }
+
+    private LabelExpression ParseLabelNot()
+    {
+        if (Accept(TokKind.Bang)) return new LabelNot(ParseLabelNot());
+        if (Accept(TokKind.Percent)) return new LabelWildcard();
+        if (Accept(TokKind.LParen))
+        {
+            int saved = _noPipe;
+            _noPipe = 0;
+            var e = ParseLabelOr();
+            _noPipe = saved;
+            Expect(TokKind.RParen, "')'");
+            return e;
+        }
+        return new LabelName(SchemaName());
     }
 
     private RelPattern ParseRelPattern()
@@ -668,11 +776,15 @@ internal sealed class Parser
                 Expect(TokKind.RBracket, "']'");
                 e = Mark(s, new IndexExpr(e, idx));
             }
-            else if (Is(TokKind.Colon) && PeekTok().Kind == TokKind.Ident)
+            else if (Is(TokKind.Colon) && IsLabelAtomStart(PeekTok()))
             {
-                var labels = new List<string>();
-                while (Accept(TokKind.Colon)) labels.Add(SchemaName());
-                e = Mark(s, new LabelCheckExpr(e, labels));
+                Advance();
+                var le = ParseLabelOr();
+                var conj = le.Conjuncts.ToList();
+                if (conj.All(x => x is LabelName))
+                    e = Mark(s, new LabelCheckExpr(e, conj.Select(x => ((LabelName)x).Name).ToList()));
+                else
+                    e = Mark(s, new LabelCheckExpr(e, [], le));
             }
             else return e;
         }
@@ -753,7 +865,13 @@ internal sealed class Parser
             var v = Advance().Text;
             Advance();
             var list = ParseExpr();
-            Expr? where = AcceptKw("WHERE") ? ParseExpr() : null;
+            Expr? where = null;
+            if (AcceptKw("WHERE"))
+            {
+                _noPipe++;
+                where = ParseExpr();
+                _noPipe--;
+            }
             Expr? map = Accept(TokKind.Pipe) ? ParseExpr() : null;
             Expect(TokKind.RBracket, "']'");
             return Mark(s, new ListCompExpr(v, list, where, map));
@@ -767,7 +885,13 @@ internal sealed class Parser
                 var part = ParsePatternPart();
                 if (part.Rels.Count > 0 && (IsKw("WHERE") || Is(TokKind.Pipe)))
                 {
-                    Expr? where = AcceptKw("WHERE") ? ParseExpr() : null;
+                    Expr? where = null;
+                    if (AcceptKw("WHERE"))
+                    {
+                        _noPipe++;
+                        where = ParseExpr();
+                        _noPipe--;
+                    }
                     Expect(TokKind.Pipe, "'|'");
                     var map = ParseExpr();
                     Expect(TokKind.RBracket, "']'");

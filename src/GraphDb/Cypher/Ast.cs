@@ -81,11 +81,84 @@ internal sealed class IsNullExpr(Expr operand, bool negated) : Expr
     public override IEnumerable<Expr> Children => [Operand];
 }
 
-internal sealed class LabelCheckExpr(Expr target, List<string> labels) : Expr
+internal sealed class LabelCheckExpr(Expr target, List<string> labels, LabelExpression? expression = null) : Expr
 {
     public readonly Expr Target = target;
+    /// <summary>Plain conjunction of labels (n:A:B); empty when <see cref="Expression"/> is used.</summary>
     public readonly List<string> Labels = labels;
+    /// <summary>General label expression (n:A|B, n:!A, n:%, ...).</summary>
+    public readonly LabelExpression? Expression = expression;
     public override IEnumerable<Expr> Children => [Target];
+}
+
+// ============================================================ label expressions
+
+internal abstract class LabelExpression
+{
+    public abstract bool Matches(Storage.StoreTx tx, long node);
+    public abstract override string ToString();
+
+    /// <summary>Top-level conjuncts (A&amp;B&amp;C → [A, B, C]).</summary>
+    public virtual IEnumerable<LabelExpression> Conjuncts => [this];
+}
+
+internal sealed class LabelName(string name) : LabelExpression
+{
+    public readonly string Name = name;
+    private readonly Runtime.TokenRef _token = new(name, Storage.TokenKind.Label);
+
+    public override bool Matches(Storage.StoreTx tx, long node)
+    {
+        int id = _token.Resolve(tx);
+        return id >= 0 && tx.HasLabel(node, id);
+    }
+
+    public override string ToString() => Name;
+}
+
+internal sealed class LabelWildcard : LabelExpression
+{
+    public override bool Matches(Storage.StoreTx tx, long node) => tx.NodeLabels(node).Length > 0;
+    public override string ToString() => "%";
+}
+
+internal sealed class LabelNot(LabelExpression inner) : LabelExpression
+{
+    public readonly LabelExpression Inner = inner;
+    public override bool Matches(Storage.StoreTx tx, long node) => !Inner.Matches(tx, node);
+    public override string ToString() => "!" + Inner;
+}
+
+internal sealed class LabelAnd(LabelExpression left, LabelExpression right) : LabelExpression
+{
+    public readonly LabelExpression Left = left, Right = right;
+    public override bool Matches(Storage.StoreTx tx, long node) => Left.Matches(tx, node) && Right.Matches(tx, node);
+    public override string ToString() => $"({Left}&{Right})";
+    public override IEnumerable<LabelExpression> Conjuncts => Left.Conjuncts.Concat(Right.Conjuncts);
+}
+
+internal sealed class LabelOr(LabelExpression left, LabelExpression right) : LabelExpression
+{
+    public readonly LabelExpression Left = left, Right = right;
+    public override bool Matches(Storage.StoreTx tx, long node) => Left.Matches(tx, node) || Right.Matches(tx, node);
+    public override string ToString() => $"({Left}|{Right})";
+
+    /// <summary>When the expression is a disjunction of plain names, returns them.</summary>
+    public List<string>? Names()
+    {
+        var acc = new List<string>();
+        return Collect(this, acc) ? acc : null;
+
+        static bool Collect(LabelExpression e, List<string> acc)
+        {
+            switch (e)
+            {
+                case LabelName n: acc.Add(n.Name); return true;
+                case LabelOr o: return Collect(o.Left, acc) && Collect(o.Right, acc);
+                default: return false;
+            }
+        }
+    }
 }
 
 internal sealed class ListExpr(List<Expr> items) : Expr
@@ -190,8 +263,13 @@ internal enum Direction { Out, In, Both }
 internal sealed class NodePattern(string? variable, List<string> labels, Expr? props)
 {
     public string? Variable = variable;
+    /// <summary>Labels the node must all have.</summary>
     public readonly List<string> Labels = labels;
     public readonly Expr? Props = props;
+    /// <summary>Optional disjunction: the node must have at least one of these labels.</summary>
+    public List<string>? AnyLabels;
+    /// <summary>Remaining label expression evaluated as a predicate.</summary>
+    public LabelExpression? Residual;
 }
 
 internal sealed class RelPattern(string? variable, List<string> types, Expr? props, Direction dir, bool varLength, int? min, int? max)
@@ -313,6 +391,24 @@ internal sealed class CallClause(string proc, List<Expr>? args, List<(string Fie
     public readonly List<Expr>? Args = args;
     public readonly List<(string Field, string Alias)>? Yields = yields;
     public readonly Expr? Where = where;
+}
+
+internal sealed class SubqueryClause(QueryStatement query, List<string>? imports, bool importAll, bool inTransactions, Expr? batchSize) : Clause
+{
+    public readonly QueryStatement Query = query;
+    /// <summary>Variables imported with the scope clause CALL (a, b) { ... }; null for the legacy form.</summary>
+    public readonly List<string>? Imports = imports;
+    public readonly bool ImportAll = importAll;
+    public readonly bool InTransactions = inTransactions;
+    public readonly Expr? BatchSize = batchSize;
+}
+
+internal sealed class LoadCsvClause(bool headers, Expr url, string variable, string? fieldTerminator) : Clause
+{
+    public readonly bool Headers = headers;
+    public readonly Expr Url = url;
+    public readonly string Variable = variable;
+    public readonly string? FieldTerminator = fieldTerminator;
 }
 
 internal sealed class ForeachClause(string variable, Expr list, List<Clause> body) : Clause

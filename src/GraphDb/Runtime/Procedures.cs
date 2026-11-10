@@ -27,29 +27,29 @@ internal static class Procedures
         });
         Add("db.propertykeys", ["propertyKey"], (ctx, _) =>
             ctx.Store.PropKeys.Names.Where(n => !n.StartsWith('\0')).Select(n => new[] { Value.FromString(n) }));
-        Add("db.indexes", ["name", "label", "property", "unique", "entries"], (ctx, _) =>
+        Add("db.indexes", ["name", "label", "property", "unique", "type"], (ctx, _) =>
         {
             var s = ctx.Store;
-            return s.AllIndexes.OrderBy(i => i.Name, StringComparer.Ordinal).Select(ix => new[]
+            return s.Catalog.Indexes.OrderBy(i => i.Name, StringComparer.Ordinal).Select(ix => new[]
             {
                 Value.FromString(ix.Name), Value.FromString(s.Labels.Name(ix.Label)), Value.FromString(s.PropKeys.Name(ix.Key)),
-                Value.FromBool(ix.Unique), Value.FromInt(ix.EntryCount),
+                Value.FromBool(ix.Unique), Value.FromString("RANGE"),
             });
         });
         Add("db.constraints", ["name", "label", "property"], (ctx, _) =>
         {
             var s = ctx.Store;
-            return s.AllIndexes.Where(i => i.Unique).OrderBy(i => i.Name, StringComparer.Ordinal).Select(ix => new[]
+            return s.Catalog.Indexes.Where(i => i.Unique).OrderBy(i => i.Name, StringComparer.Ordinal).Select(ix => new[]
             {
                 Value.FromString(ix.Name), Value.FromString(s.Labels.Name(ix.Label)), Value.FromString(s.PropKeys.Name(ix.Key)),
             });
         });
-        Add("db.stats", ["nodes", "relationships", "labels", "relationshipTypes", "propertyKeys"], (ctx, _) =>
+        Add("db.stats", ["nodes", "relationships", "labels", "relationshipTypes", "propertyKeys", "dataPages"], (ctx, _) =>
         {
             var s = ctx.Store;
-            return [[Value.FromInt(s.NodeCount), Value.FromInt(s.RelCount), Value.FromInt(s.Labels.Count), Value.FromInt(s.RelTypes.Count), Value.FromInt(s.PropKeys.Count)]];
-        });
-        Add("dbms.components", ["name", "versions", "edition"], (ctx, _) =>
+            return [[Value.FromInt(s.NodeCount), Value.FromInt(s.RelCount), Value.FromInt(s.Labels.Count), Value.FromInt(s.RelTypes.Count),
+                Value.FromInt(s.PropKeys.Count), Value.FromInt(s.DataPages)]];
+        });        Add("dbms.components", ["name", "versions", "edition"], (ctx, _) =>
             [[Value.FromString("GraphDb"), Value.FromList([Value.FromString(typeof(Procedures).Assembly.GetName().Version?.ToString() ?? "0")]), Value.FromString("embedded")]]);
     }
 

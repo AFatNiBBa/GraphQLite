@@ -42,6 +42,15 @@ internal static class ValueOps
                         return true;
                     }
                 case ValueKind.Path: return ((GraphPath)a.Obj!).SameAs((GraphPath)b.Obj!);
+                case ValueKind.Date:
+                case ValueKind.LocalTime:
+                case ValueKind.LocalDateTime:
+                case ValueKind.DateTime:
+                    return a.Num == b.Num;
+                case ValueKind.Time: return Temporal.TimeUtcTicks(a) == Temporal.TimeUtcTicks(b);
+                case ValueKind.Duration:
+                case ValueKind.Point:
+                    return a.Obj!.Equals(b.Obj);
             }
             return false;
         }
@@ -84,6 +93,15 @@ internal static class ValueOps
                 }
             case ValueKind.Node: return HashCode.Combine(1, v.Num);
             case ValueKind.Relationship: return HashCode.Combine(2, v.Num);
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+            case ValueKind.LocalDateTime:
+            case ValueKind.DateTime:
+                return HashCode.Combine((int)v.Kind, v.Num);
+            case ValueKind.Time: return HashCode.Combine(9, Temporal.TimeUtcTicks(v));
+            case ValueKind.Duration:
+            case ValueKind.Point:
+                return v.Obj!.GetHashCode();
             case ValueKind.Path:
                 {
                     var p = (GraphPath)v.Obj!;
@@ -140,6 +158,7 @@ internal static class ValueOps
                         return unknown ? Value.Null : Value.True;
                     }
                 case ValueKind.Path: return Value.FromBool(((GraphPath)a.Obj!).SameAs((GraphPath)b.Obj!));
+                default: return Value.FromBool(Equivalent(a, b));
             }
         }
         if (a.IsNumber && b.IsNumber) return Value.FromBool(a.AsDouble() == b.AsDouble());
@@ -163,6 +182,12 @@ internal static class ValueOps
         {
             case ValueKind.String: return string.CompareOrdinal(a.Str, b.Str);
             case ValueKind.Boolean: return a.Num.CompareTo(b.Num);
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+            case ValueKind.LocalDateTime:
+            case ValueKind.DateTime:
+                return a.Num.CompareTo(b.Num);
+            case ValueKind.Time: return Temporal.TimeUtcTicks(a).CompareTo(Temporal.TimeUtcTicks(b));
             case ValueKind.List:
                 {
                     var x = a.ListItems; var y = b.ListItems;
@@ -188,10 +213,17 @@ internal static class ValueOps
         ValueKind.Relationship => 2,
         ValueKind.List => 3,
         ValueKind.Path => 4,
-        ValueKind.String => 5,
-        ValueKind.Boolean => 6,
-        ValueKind.Integer or ValueKind.Float => 7,
-        _ => 8, // null last
+        ValueKind.Point => 5,
+        ValueKind.DateTime => 6,
+        ValueKind.LocalDateTime => 7,
+        ValueKind.Date => 8,
+        ValueKind.Time => 9,
+        ValueKind.LocalTime => 10,
+        ValueKind.Duration => 11,
+        ValueKind.String => 12,
+        ValueKind.Boolean => 13,
+        ValueKind.Integer or ValueKind.Float => 14,
+        _ => 15, // null last
     };
 
     public static int OrderCompare(in Value a, in Value b)
@@ -220,7 +252,23 @@ internal static class ValueOps
             case ValueKind.Boolean: return a.Num.CompareTo(b.Num);
             case ValueKind.Node:
             case ValueKind.Relationship:
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+            case ValueKind.LocalDateTime:
+            case ValueKind.DateTime:
                 return a.Num.CompareTo(b.Num);
+            case ValueKind.Time: return Temporal.TimeUtcTicks(a).CompareTo(Temporal.TimeUtcTicks(b));
+            case ValueKind.Duration:
+                {
+                    var x = a.AsDuration(); var y = b.AsDuration();
+                    int c = x.ApproxSeconds.CompareTo(y.ApproxSeconds);
+                    return c != 0 ? c : (x.Months, x.Days, x.Seconds, x.Nanoseconds).CompareTo((y.Months, y.Days, y.Seconds, y.Nanoseconds));
+                }
+            case ValueKind.Point:
+                {
+                    var x = a.AsPoint(); var y = b.AsPoint();
+                    return (x.Srid, x.X, x.Y, x.Z ?? 0).CompareTo((y.Srid, y.X, y.Y, y.Z ?? 0));
+                }
             case ValueKind.List:
                 {
                     var x = a.ListItems; var y = b.ListItems;

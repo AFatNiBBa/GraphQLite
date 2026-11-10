@@ -55,6 +55,8 @@ internal static class ExprOps
         }
         if (a.IsNull || b.IsNull) return Value.Null;
         if (a.IsNumber && b.IsNumber) return Value.FromFloat(a.AsDouble() + b.AsDouble());
+        if (b.Kind == ValueKind.Duration && (a.IsTemporal || a.Kind == ValueKind.Duration)) return Temporal.AddDuration(a, b.AsDuration());
+        if (a.Kind == ValueKind.Duration && b.IsTemporal) return Temporal.AddDuration(b, a.AsDuration());
         if (a.Kind == ValueKind.String && b.Kind == ValueKind.String) return Value.FromString(string.Concat(a.Str, b.Str));
         if (a.Kind == ValueKind.String && b.IsNumber) return Value.FromString(a.Str + b.ToDisplayString());
         if (b.Kind == ValueKind.String && a.IsNumber) return Value.FromString(a.ToDisplayString() + b.Str);
@@ -72,6 +74,7 @@ internal static class ExprOps
         }
         if (a.IsNull || b.IsNull) return Value.Null;
         if (a.IsNumber && b.IsNumber) return Value.FromFloat(a.AsDouble() - b.AsDouble());
+        if (b.Kind == ValueKind.Duration && (a.IsTemporal || a.Kind == ValueKind.Duration)) return Temporal.AddDuration(a, b.AsDuration().Negate());
         throw TypeErr("-", a, b);
     }
 
@@ -86,6 +89,8 @@ internal static class ExprOps
         }
         if (a.IsNull || b.IsNull) return Value.Null;
         if (a.IsNumber && b.IsNumber) return Value.FromFloat(a.AsDouble() * b.AsDouble());
+        if (a.Kind == ValueKind.Duration && b.IsNumber) return Value.FromDuration(a.AsDuration().Multiply(b.AsDouble()));
+        if (b.Kind == ValueKind.Duration && a.IsNumber) return Value.FromDuration(b.AsDuration().Multiply(a.AsDouble()));
         throw TypeErr("*", a, b);
     }
 
@@ -99,6 +104,7 @@ internal static class ExprOps
         }
         if (a.IsNull || b.IsNull) return Value.Null;
         if (a.IsNumber && b.IsNumber) return Value.FromFloat(a.AsDouble() / b.AsDouble());
+        if (a.Kind == ValueKind.Duration && b.IsNumber) return Value.FromDuration(a.AsDuration().Multiply(1.0 / b.AsDouble()));
         throw TypeErr("/", a, b);
     }
 
@@ -127,6 +133,7 @@ internal static class ExprOps
         ValueKind.Integer => a.Num == long.MinValue ? throw Overflow() : Value.FromInt(-a.Num),
         ValueKind.Float => Value.FromFloat(-a.FloatBits),
         ValueKind.Null => Value.Null,
+        ValueKind.Duration => Value.FromDuration(a.AsDuration().Negate()),
         _ => throw new CypherRuntimeException($"Cannot negate {a.Kind}"),
     };
 
@@ -250,29 +257,21 @@ internal static class ExprOps
         switch (target.Kind)
         {
             case ValueKind.Node:
-                {
-                    int k = key.Resolve(ctx.Store);
-                    if (k < 0) return Value.Null;
-                    var store = ctx.Store;
-                    int id = target.EntityId;
-                    if ((uint)id >= (uint)store.NodeHigh) return Value.Null;
-                    var p = store.Nodes[id].Props;
-                    return p is null ? Value.Null : p.Get(k);
-                }
+                return ctx.Store.NodeProp(target.EntityId, key.Resolve(ctx.Store));
             case ValueKind.Relationship:
-                {
-                    int k = key.Resolve(ctx.Store);
-                    if (k < 0) return Value.Null;
-                    var store = ctx.Store;
-                    int id = target.EntityId;
-                    if ((uint)id >= (uint)store.RelHigh) return Value.Null;
-                    var p = store.Rels[id].Props;
-                    return p is null ? Value.Null : p.Get(k);
-                }
+                return ctx.Store.RelProp(target.EntityId, key.Resolve(ctx.Store));
             case ValueKind.Map:
                 return target.MapItems.TryGetValue(key.Name, out var v) ? v : Value.Null;
             case ValueKind.Null:
                 return Value.Null;
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+            case ValueKind.Time:
+            case ValueKind.LocalDateTime:
+            case ValueKind.DateTime:
+            case ValueKind.Duration:
+            case ValueKind.Point:
+                return Temporal.Component(target, key.Name);
             default:
                 throw new CypherRuntimeException($"Cannot access property '{key.Name}' on {target.Kind}");
         }
@@ -286,6 +285,8 @@ internal static class ExprOps
             case ValueKind.Relationship: return ctx.Store.RelProp(target.EntityId, ctx.Store.PropKeys.Lookup(key));
             case ValueKind.Map: return target.MapItems.TryGetValue(key, out var v) ? v : Value.Null;
             case ValueKind.Null: return Value.Null;
+            case ValueKind.Date or ValueKind.LocalTime or ValueKind.Time or ValueKind.LocalDateTime or ValueKind.DateTime or ValueKind.Duration or ValueKind.Point:
+                return Temporal.Component(target, key);
             default: throw new CypherRuntimeException($"Cannot access property '{key}' on {target.Kind}");
         }
     }
@@ -327,13 +328,21 @@ internal static class ExprOps
         if (target.Kind != ValueKind.Node) throw new CypherRuntimeException($"Label check requires a node, got {target.Kind}");
         var store = ctx.Store;
         if (!store.NodeAlive(target.EntityId)) return Value.False;
-        ref var n = ref store.Nodes[target.EntityId];
         foreach (var l in labels)
         {
             int id = l.Resolve(store);
-            if (id < 0 || !n.HasLabel(id)) return Value.False;
+            if (id < 0 || !store.HasLabel(target.EntityId, id)) return Value.False;
         }
         return Value.True;
+    }
+
+    /// <summary>Evaluates a label expression (AND / OR / NOT of labels, % wildcard) on a node.</summary>
+    public static Value LabelExpr(ExecContext ctx, in Value target, Cypher.LabelExpression expr)
+    {
+        if (target.IsNull) return Value.Null;
+        if (target.Kind != ValueKind.Node) throw new CypherRuntimeException($"Label check requires a node, got {target.Kind}");
+        if (!ctx.Store.NodeAlive(target.EntityId)) return Value.False;
+        return Value.FromBool(expr.Matches(ctx.Store, target.EntityId));
     }
 
     public static Value[] AsList(in Value v, string fn)

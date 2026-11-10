@@ -1,29 +1,31 @@
 # GraphDb
 
 Graph database **embedded** (in-process, come SQLite) per .NET 10, interrogabile in **openCypher**.
+Il grafo vive in una directory di file memory-mapped e può essere molto più grande della RAM.
 
 ```csharp
 using GraphDb;
 
-using var db = GraphDatabase.Open("social.gdb");          // oppure GraphDatabase.OpenInMemory()
+using var db = GraphDatabase.Open("social.db");            // una directory; oppure GraphDatabase.OpenInMemory()
 
 db.Execute("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS UNIQUE");
 db.Execute("""
-    CREATE (a:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2010}]->(b:Person {name: 'Bob', age: 25})
+    CREATE (a:Person {name: 'Alice', born: date('1990-05-17'), profile: {city: 'Rome', langs: ['it', 'en']}})
+           -[:KNOWS {since: datetime('2010-01-01T10:00Z')}]->
+           (b:Person {name: 'Bob', home: point({longitude: 12.49, latitude: 41.90})})
     """);
 
 var result = db.Execute(
-    "MATCH (p:Person)-[:KNOWS]->(f) WHERE p.age > $min RETURN p.name AS name, collect(f.name) AS friends",
-    new Dictionary<string, object?> { ["min"] = 18 });
+    "MATCH (p:Person)-[:KNOWS]->(f) WHERE p.profile.city = $city RETURN p.name AS name, collect(f.name) AS friends",
+    new Dictionary<string, object?> { ["city"] = "Rome" });
 
 foreach (var row in result)
     Console.WriteLine($"{row.Get<string>("name")}: {row["friends"]}");
 
-// transazioni esplicite
-using (var tx = db.BeginTransaction())
+using (var tx = db.BeginTransaction())                     // transazione esplicita
 {
-    tx.Execute("MATCH (p:Person {name: 'Bob'}) SET p.age = p.age + 1");
-    tx.Commit();                                          // Dispose senza Commit = rollback
+    tx.Execute("MATCH (p:Person {name: 'Bob'}) SET p.visits = coalesce(p.visits, 0) + 1");
+    tx.Commit();                                           // Dispose senza Commit = rollback
 }
 ```
 
@@ -32,94 +34,155 @@ using (var tx = db.BeginTransaction())
 | Percorso | Contenuto |
 |---|---|
 | `src/GraphDb` | la libreria |
-| `tests/GraphDb.Tests` | test xUnit (semantica Cypher, persistenza, crash recovery, concorrenza) |
-| `tools/GraphDb.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphDb.Shell -- file.gdb`) |
-| `tools/GraphDb.Bench` | benchmark (`dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [file]`) |
+| `tests/GraphDb.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità |
+| `tools/GraphDb.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphDb.Shell -- mydb`) |
+| `tools/GraphDb.Bench` | benchmark (`dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [directory]`) |
 
 ```
 dotnet build GraphDb.slnx
 dotnet test  GraphDb.slnx
 ```
 
-## Concorrenza
+## Storage (grafo più grande della RAM)
 
-- **Letture concorrenti illimitate**: `db.Execute` di una query di sola lettura (o `BeginReadTransaction`) entra con
-  un solo CAS su un lock lettori/scrittore, senza passare dal kernel. Le letture scalano linearmente con i core.
-- **Uno scrittore alla volta** (come SQLite): una transazione di scrittura esclude i lettori solo mentre è aperta.
-  Il lock è *writer-preferring*, quindi gli scrittori non soffrono di starvation.
-- Il checkpoint (snapshot completo) gira **in parallelo ai lettori**: blocca solo gli altri scrittori.
-- Il lock non è legato al thread: una transazione può essere chiusa da un thread diverso da quello che l'ha aperta.
-- Le letture vedono sempre e solo transazioni committate per intero (isolamento serializzabile).
+Un database è una **directory**:
 
-## Persistenza (modello SQLite WAL)
-
-- `file.gdb` contiene uno snapshot binario; `file.gdb-wal` riceve un frame per ogni commit.
-- Ogni frame ha CRC32C calcolato in hardware (`BitOperations.Crc32C`) e un numero di sequenza;
-  alla riapertura si carica lo snapshot e si riapplicano i frame più recenti. Una coda troncata
-  (crash a metà scrittura) viene scartata.
-- Il checkpoint scrive lo snapshot su file temporaneo e lo rinomina atomicamente; è idempotente rispetto
-  a un crash prima del troncamento del WAL. Avviene in automatico oltre `AutoCheckpointBytes` (64 MB) e alla chiusura.
-- `SyncMode`: `Off` / `Normal` (flush su OS a ogni commit, default) / `Full` (fsync a ogni commit).
-- Il file WAL è aperto in esclusiva: un secondo processo riceve "database is locked".
-
-Il grafo è interamente in memoria (come un database SQLite con cache illimitata): la dimensione massima è la RAM.
-
-## Cosa c'è sotto (perché è veloce)
-
-- **Storage a struct-of-arrays**: nodi e relazioni sono `struct` in array contigui; le liste di adiacenza sono
-  inline nel nodo e ogni voce contiene già *vicino* e *tipo*, quindi un'espansione non tocca mai il record della relazione.
-- **Indice delle label a bitset** con iterazione `TrailingZeroCount`; ricerca delle proprietà con `Span.IndexOf` (SIMD).
-- **`Value`** è una struct discriminata da 24 byte: niente boxing per interi, float, booleani, nodi, relazioni.
-- **Compilazione delle espressioni in closure** (niente interprete dell'AST a runtime) e operatori **pull a cursore**
-  che scrivono in-place su un'unica riga "larga" (`Value[]`): zero allocazioni per riga nei percorsi caldi.
-- **Planner cost-based**: sceglie il punto di partenza fra index seek (unique / normale / `IN`), seek per `id()`,
-  scan per label (la più piccola) o all-nodes; spinge i filtri al primo punto in cui le variabili sono legate;
-  usa `ExpandInto` sui cicli; Top-N con heap per `ORDER BY … LIMIT`; `shortestPath` con BFS bidirezionale.
-- **Cache dei piani** per testo della query (invalidata automaticamente dai cambi di schema) e parametri risolti
-  per indice, non per nome.
-- WAL con serializzazione varint su `Span<byte>`, I/O binario senza stream intermedi.
-
-Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 24 core, in-memory):
-
-| Operazione | Throughput |
+| File | Contenuto |
 |---|---|
-| lookup su indice unique, 1 thread | ~0,6–0,9 M query/s |
-| lookup su indice unique, 24 thread | ~8 M query/s |
-| 2-hop friends-of-friends, 24 thread | ~1,4 M query/s |
-| scan per label + group by | ~10 M righe/s |
-| espansione di tutte le relazioni + filtro | ~4 M relazioni/s |
-| `shortestPath` (≤ 6 hop) | ~15 k query/s |
-| bulk insert relazioni (`UNWIND` + 2 index seek) | ~300 k/s |
+| `nodes` | record dei nodi a dimensione fissa (48 byte), indirizzati per id |
+| `rels` | record delle relazioni (32 byte), indirizzati per id |
+| `data` | header, proprietà, blocchi di adiacenza, bitmap delle label, indici B+tree, cataloghi, token |
+| `wal` | write-ahead log |
+
+- I file sono paginati (8 KB) e **memory-mapped a segmenti**. I segmenti crescono in modo geometrico (1 MB … 64 MB) e
+  non vengono mai rimappati, quindi la crescita del file non invalida le letture in corso. La memoria residente la
+  decide il sistema operativo (page cache): il grafo non deve stare in RAM.
+- **32 bit**: funziona finché il database entra nello spazio di indirizzamento del processo (~1–1,5 GB).
+- **Proprietà**: blob compatti `[chiavi][offset][valori]`. La lettura di una singola proprietà fa una ricerca SIMD
+  sulle chiavi direttamente nella pagina mappata e decodifica solo quel valore. I valori oltre 4 KB vanno in catene di
+  pagine di overflow (documenti JSON grandi a piacere).
+- **Adiacenza**: liste a blocchi per nodo (out/in). Ogni voce contiene relazione, vicino e tipo, quindi
+  un'espansione legge pagine contigue senza toccare i record delle relazioni.
+- **Label**: un bitmap per label (una pagina ogni 65 536 nodi). Le scansioni fanno AND/OR di parole a 64 bit.
+- Lo spazio liberato (blob, pagine, blocchi) viene riutilizzato tramite free list per classe di dimensione.
+
+### Transazioni, concorrenza, durabilità (MVCC a pagine, modello SQLite WAL)
+
+- Lo scrittore modifica **copie private** delle pagine (copy-on-write). Al commit le pagine vengono scritte nel WAL e
+  pubblicate come nuove *versioni* in memoria.
+- Ogni lettura lavora su uno **snapshot**: vede sempre e solo transazioni committate per intero, e **non viene mai
+  bloccata dagli scrittori** (né viceversa). Si possono eseguire letture concorrenti illimitate, mentre gli scrittori
+  vengono serializzati.
+- Il **checkpoint** (automatico oltre `CheckpointThresholdBytes`, 256 MB, oppure con `db.Checkpoint()`) copia le versioni più
+  recenti nei file mappati, li sincronizza su disco e tronca il WAL. Esclude i lettori solo per il tempo della copia in
+  memoria.
+- **WAL a delta**: per ogni pagina si registrano solo gli intervalli di byte cambiati (o l'immagine intera se è cambiata
+  più di metà pagina). I frame hanno CRC32C hardware. In recovery una coda troncata viene scartata. Il replay è
+  idempotente byte per byte, quindi è corretto anche dopo un checkpoint interrotto a metà.
+- `SyncMode`: `Off`, `Normal` (default) oppure `Full`:
+  - con `Normal` il commit fa flush verso il sistema operativo. Dopo un power loss si possono perdere gli ultimi commit,
+    ma il database non si corrompe, perché i file dati vengono scritti solo dopo il fsync del WAL;
+  - con `Full` ogni commit fa fsync.
+- **Atomicità per statement**: una query che fallisce dentro una transazione esplicita viene annullata da sola, e la
+  transazione resta utilizzabile.
+- `CALL { … } IN TRANSACTIONS OF n ROWS` committa a lotti, così si importano dataset enormi senza tenere tutto in memoria.
+
+## Prestazioni
+
+Le tecniche principali:
+- valori come struct da 24 byte, senza boxing;
+- espressioni compilate in closure;
+- operatori pull che scrivono in-place su un'unica riga;
+- planner cost-based (index seek per uguaglianza/IN/range/prefisso, seek per `id()`, scan della label più piccola,
+  `ExpandInto` sui cicli, Top-N con heap, `shortestPath` con BFS bidirezionale);
+- cache dei piani lock-free;
+- lookup delle pagine con tabelle sparse lock-free (due accessi ad array).
+
+Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 24 core):
+
+| Operazione | In memoria |
+|---|---|
+| lookup su indice unique, 1 thread | ~0,8 M query/s |
+| lookup su indice unique, 24 thread | ~6 M query/s |
+| 2-hop friends-of-friends, 24 thread | ~1,3 M query/s |
+| scan per label + filtro | ~11 M righe/s |
+| espansione di tutte le relazioni + filtro su proprietà | ~10 M relazioni/s |
+| `shortestPath` (≤ 6 hop) | ~12 k query/s |
+| bulk insert relazioni (`UNWIND` + 2 index seek) | ~120 k/s (su disco ~70 k/s) |
 
 ## openCypher supportato
 
-**Clausole**: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN` / `WITH` (`DISTINCT`, `*`, alias, `ORDER BY`, `SKIP`, `LIMIT`),
-`UNWIND`, `CREATE`, `MERGE` (`ON CREATE SET` / `ON MATCH SET`), `SET` (`n.p =`, `n = {}`, `n += {}`, `n:Label`),
-`REMOVE`, `DELETE`, `DETACH DELETE`, `FOREACH`, `UNION` / `UNION ALL`, `CALL proc() YIELD …`, `EXPLAIN`.
+**Clausole**:
+- `MATCH`, `OPTIONAL MATCH`, `WHERE`;
+- `RETURN` / `WITH` (`DISTINCT`, `*`, alias, `ORDER BY`, `SKIP`, `LIMIT`);
+- `UNWIND`, `CREATE`, `MERGE` (`ON CREATE SET` / `ON MATCH SET`);
+- `SET` (`n.p =`, `n = {}`, `n += {}`, `n:Label`), `REMOVE`, `DELETE`, `DETACH DELETE`;
+- `FOREACH`, `UNION` / `UNION ALL`;
+- `CALL proc() YIELD …`;
+- **`CALL { … }`** e **`CALL (x, y) { … }`** (anche con `UNION` interno), **`IN TRANSACTIONS [OF n ROWS]`**;
+- **`LOAD CSV [WITH HEADERS] FROM … AS row [FIELDTERMINATOR …]`**;
+- `EXPLAIN`.
 
-**Pattern**: label multiple, proprietà inline, direzioni `->` `<-` `-`, tipi alternativi `[:A|B]`,
-lunghezza variabile `*`, `*n`, `*n..m`, `*..m`, path con nome `p = (…)`, `shortestPath`, `allShortestPaths`,
-unicità delle relazioni all'interno di un `MATCH`.
+**Pattern**:
+- direzioni `->` `<-` `-` e tipi alternativi `[:A|B]`;
+- lunghezza variabile `*`, `*n`, `*n..m`;
+- path con nome, `shortestPath`, `allShortestPaths`;
+- unicità delle relazioni all'interno di un `MATCH`;
+- **espressioni sulle label**: `:A|B` (OR), `:A&B` / `:A:B` (AND), `:!A` (NOT), `:%` (qualunque label), parentesi.
 
-**Espressioni**: aritmetica, confronti concatenati, logica a tre valori (`AND OR XOR NOT`), `IS [NOT] NULL`, `IN`,
-`STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`, `CASE` (semplice e generico), accesso a proprietà / indici / slice,
-list comprehension, pattern comprehension, `all/any/none/single`, `reduce`, map projection `n {.a, .*, k: expr}`,
-predicati di pattern `(a)-->(b)`, `EXISTS { … }`, `COUNT { … }`, parametri `$p`.
+**Espressioni**:
+- aritmetica, confronti concatenati, logica a tre valori;
+- `IS [NOT] NULL`, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`, `CASE`;
+- proprietà annidate (`n.doc.address.city`), indici e slice;
+- list comprehension e pattern comprehension;
+- `all/any/none/single`, `reduce`, map projection;
+- `EXISTS { … }`, `COUNT { … }`, parametri.
 
-**Funzioni**: `id elementId labels type keys properties startNode endNode nodes relationships length size head last
-tail reverse range isEmpty coalesce exists timestamp randomUUID rand pi e toInteger toFloat toString toBoolean
-(+ varianti *OrNull) toUpper toLower trim ltrim rtrim substring left right replace split abs sign ceil floor round
-sqrt exp log log10 sin cos tan cot asin acos atan atan2 degrees radians`.
-**Aggregazioni**: `count(*) count sum avg min max collect stDev stDevP percentileCont percentileDisc`, anche `DISTINCT`.
+**Tipi di valore** (anche come proprietà):
+- null, booleani, interi a 64 bit, float, stringhe;
+- **liste e mappe annidate a piacere** (campi JSON). Neo4j accetta solo array di primitivi, ma è una scelta di design
+  e non un vincolo di prestazioni, quindi qui sono permessi;
+- **`date`, `localtime`, `time`, `localdatetime`, `datetime`** (con offset o fuso IANA), **`duration`**;
+- **`point`** (cartesiano 2D/3D, WGS-84).
 
-**Schema**: `CREATE INDEX [nome] [IF NOT EXISTS] FOR (n:L) ON (n.p)`, `CREATE CONSTRAINT [nome] [IF NOT EXISTS]
-FOR (n:L) REQUIRE n.p IS UNIQUE`, `DROP INDEX|CONSTRAINT nome [IF EXISTS]` (anche sintassi legacy `ON :L(p)`).
+**Funzioni**:
+- scalari, stringhe, liste e matematiche (vedi `Functions.cs`);
+- temporali: costruttori da stringa ISO-8601, mappa o altro temporale; `.truncate`, `.realtime/.statement/.transaction`;
+  `datetime.fromEpoch[Millis]`; `duration.between/inMonths/inDays/inSeconds`; accessori (`d.year`, `dt.epochMillis`,
+  `du.hours`, …); aritmetica temporale ± durata e durata × numero;
+- spaziali: `point`, `point.distance` (haversine per WGS-84), `point.withinBBox`;
+- JSON: `toJson`, `fromJson` (alias `apoc.convert.toJson/fromJsonMap/fromJsonList`), `valueType`.
 
-**Procedure**: `db.labels`, `db.relationshipTypes`, `db.propertyKeys`, `db.indexes`, `db.constraints`, `db.stats`, `dbms.components`.
+**Aggregazioni**: `count`, `sum`, `avg`, `min`, `max`, `collect`, `stDev`, `stDevP`, `percentileCont`,
+`percentileDisc`, tutte anche con `DISTINCT`.
 
-### Limiti noti
+**Schema**:
+- `CREATE INDEX [nome] [IF NOT EXISTS] FOR (n:L) ON (n.p)`;
+- `CREATE CONSTRAINT … REQUIRE n.p IS UNIQUE`;
+- `DROP INDEX|CONSTRAINT nome [IF EXISTS]`.
 
-- Niente tipi temporali / spaziali (`date()`, `point()`), niente `CALL { subquery }`, niente `LOAD CSV`.
-- Gli indici sono hash (uguaglianza e `IN`); i range (`<`, `>`) usano scan + filtro.
-- Le label `:A|B` nei nodi sono trattate come congiunzione (come `:A:B`).
-- Singolo processo: un altro processo non può aprire lo stesso file contemporaneamente.
+Gli indici sono **B+tree** su disco con chiavi order-preserving. Servono uguaglianza, `IN`, range (`<`, `<=`, `>`, `>=`,
+anche combinati) e `STARTS WITH`, su numeri, stringhe, booleani e temporali.
+
+**Procedure**: `db.labels`, `db.relationshipTypes`, `db.propertyKeys`, `db.indexes`, `db.constraints`, `db.stats`,
+`dbms.components`.
+
+**Parametri .NET**: primitivi, `string`, `DateOnly`, `TimeOnly`, `DateTime`, `DateTimeOffset`, `TimeSpan`,
+dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
+
+**LOAD CSV**:
+- legge file locali (percorso o `file:///`);
+- con `DatabaseOptions.CsvImportDirectory` i percorsi sono confinati in una directory;
+- `http(s)` va abilitato esplicitamente con `AllowRemoteCsv`.
+
+## Limiti noti
+
+- **Un solo processo** per database: la directory è aperta in esclusiva. Più processi richiederebbero un indice delle
+  versioni in shared memory e lock tra processi (come il file `-shm` di SQLite). Si può aggiungere, ma è un pezzo
+  di architettura a sé.
+- Le date sono limitate agli anni 1–9999 e la precisione temporale è di 100 ns (tick .NET).
+- Gli indici coprono una sola proprietà (niente indici compositi o full-text).
+- Una transazione di scrittura tiene in memoria le pagine che modifica: per import molto grandi usare
+  `CALL { … } IN TRANSACTIONS`.
+- Un checkpoint deve attendere la fine dei lettori in corso: le letture lunghissime lo rimandano. In casi estremi il
+  checkpoint diventa bloccante quando la memoria delle versioni supera 8× la soglia.

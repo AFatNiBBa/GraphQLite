@@ -75,18 +75,18 @@ public sealed class Relationship : IEquatable<Relationship>
 /// <summary>A path: alternating nodes and relationships.</summary>
 public sealed class GraphPath
 {
-    internal readonly int[] NodeIds;
-    internal readonly int[] RelIds;
+    internal readonly long[] NodeIds;
+    internal readonly long[] RelIds;
     private readonly Node[]? _nodes;
     private readonly Relationship[]? _rels;
 
-    internal GraphPath(int[] nodeIds, int[] relIds)
+    internal GraphPath(long[] nodeIds, long[] relIds)
     {
         NodeIds = nodeIds;
         RelIds = relIds;
     }
 
-    internal GraphPath(int[] nodeIds, int[] relIds, Node[] nodes, Relationship[] rels) : this(nodeIds, relIds)
+    internal GraphPath(long[] nodeIds, long[] relIds, Node[] nodes, Relationship[] rels) : this(nodeIds, relIds)
     {
         _nodes = nodes;
         _rels = rels;

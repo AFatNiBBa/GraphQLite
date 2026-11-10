@@ -17,7 +17,6 @@ internal sealed class CreateSpec(CreateNodeSpec[] nodes, CreateRelSpec[] rels, P
     public void Execute(ExecContext ctx)
     {
         var store = ctx.Store;
-        var log = ctx.WriteLog;
         var row = ctx.Row;
         foreach (var n in Nodes)
         {
@@ -26,12 +25,11 @@ internal sealed class CreateSpec(CreateNodeSpec[] nodes, CreateRelSpec[] rels, P
             {
                 labels = new int[n.Labels.Length];
                 for (int i = 0; i < labels.Length; i++) labels[i] = n.Labels[i].GetOrCreate(store);
-                labels = labels.Distinct().ToArray();
             }
             var props = n.Props?.Invoke(ctx);
-            int id = store.CreateNode(labels, props, log);
+            long id = store.CreateNode(labels, props);
             ctx.Stats.NodesCreated++;
-            ctx.Stats.LabelsAdded += labels?.Length ?? 0;
+            ctx.Stats.LabelsAdded += labels?.Distinct().Count() ?? 0;
             ctx.Stats.PropertiesSet += props?.Count ?? 0;
             row[n.Slot] = Value.FromNodeId(id);
         }
@@ -42,7 +40,7 @@ internal sealed class CreateSpec(CreateNodeSpec[] nodes, CreateRelSpec[] rels, P
             if (a.Kind != ValueKind.Node || b.Kind != ValueKind.Node)
                 throw new CypherRuntimeException("Failed to create relationship: endpoint node is null");
             var props = r.Props?.Invoke(ctx);
-            int id = store.CreateRel(a.EntityId, b.EntityId, r.Type.GetOrCreate(store), props, log);
+            long id = store.CreateRel(a.EntityId, b.EntityId, r.Type.GetOrCreate(store), props);
             ctx.Stats.RelationshipsCreated++;
             ctx.Stats.PropertiesSet += props?.Count ?? 0;
             row[r.Slot] = Value.FromRelId(id);
@@ -72,7 +70,7 @@ internal static class Mutations
         foreach (var kv in m)
         {
             if (kv.Value.IsNull) continue;
-            GraphStore.ValidatePropertyValue(kv.Value);
+            StoreTx.ValidatePropertyValue(kv.Value);
             props.Set(ctx.Store.PropKeys.GetOrCreate(kv.Key), kv.Value);
         }
         return props.Count == 0 ? null : props;
@@ -80,13 +78,13 @@ internal static class Mutations
 
     private static void SetProp(ExecContext ctx, in Value entity, int key, in Value v)
     {
-        if (entity.Kind == ValueKind.Node) ctx.Store.SetNodeProp(entity.EntityId, key, v, ctx.WriteLog);
-        else ctx.Store.SetRelProp(entity.EntityId, key, v, ctx.WriteLog);
+        if (entity.Kind == ValueKind.Node) ctx.Store.SetNodeProp(entity.EntityId, key, v);
+        else ctx.Store.SetRelProp(entity.EntityId, key, v);
         ctx.Stats.PropertiesSet++;
     }
 
     private static PropertyMap? PropsOf(ExecContext ctx, in Value entity) =>
-        entity.Kind == ValueKind.Node ? ctx.Store.Nodes[entity.EntityId].Props : ctx.Store.Rels[entity.EntityId].Props;
+        ctx.Store.DecodeProps(entity.Kind == ValueKind.Node ? ctx.Store.NodePropsAddr(entity.EntityId) : ctx.Store.RelPropsAddr(entity.EntityId));
 
     private static void CheckEntity(ExecContext ctx, in Value e)
     {
@@ -125,20 +123,15 @@ internal static class Mutations
                     Dictionary<string, Value> map = src.Kind switch
                     {
                         ValueKind.Map => src.MapItems,
-                        ValueKind.Node => store.PropsToMap(store.Nodes[src.EntityId].Props),
-                        ValueKind.Relationship => store.PropsToMap(store.Rels[src.EntityId].Props),
+                        ValueKind.Node => store.PropsDict(store.NodePropsAddr(src.EntityId)),
+                        ValueKind.Relationship => store.PropsDict(store.RelPropsAddr(src.EntityId)),
                         ValueKind.Null => new Dictionary<string, Value>(),
                         _ => throw new CypherRuntimeException($"Expected a map, got {src.Kind}"),
                     };
-                    if (item.Kind == SetKind.ReplaceMap)
+                    if (item.Kind == SetKind.ReplaceMap && PropsOf(ctx, target) is { } existing)
                     {
-                        var existing = PropsOf(ctx, target);
-                        if (existing != null)
-                        {
-                            var keys = existing.Keys.ToArray();
-                            foreach (var k in keys)
-                                if (!map.ContainsKey(store.PropKeys.Name(k))) SetProp(ctx, target, k, Value.Null);
-                        }
+                        foreach (var k in existing.Keys.ToArray())
+                            if (!map.ContainsKey(store.PropKeys.Name(k))) SetProp(ctx, target, k, Value.Null);
                     }
                     foreach (var kv in map)
                     {
@@ -156,7 +149,7 @@ internal static class Mutations
                     if (target.Kind != ValueKind.Node) throw new CypherRuntimeException("Labels can only be set on nodes");
                     CheckEntity(ctx, target);
                     foreach (var l in item.Labels!)
-                        if (store.AddLabel(target.EntityId, l.GetOrCreate(store), ctx.WriteLog)) ctx.Stats.LabelsAdded++;
+                        if (store.AddLabel(target.EntityId, l.GetOrCreate(store))) ctx.Stats.LabelsAdded++;
                     break;
                 }
         }
@@ -174,7 +167,7 @@ internal static class Mutations
             foreach (var l in item.Labels!)
             {
                 int id = l.Resolve(store);
-                if (id >= 0 && store.RemoveLabel(target.EntityId, id, ctx.WriteLog)) ctx.Stats.LabelsRemoved++;
+                if (id >= 0 && store.RemoveLabel(target.EntityId, id)) ctx.Stats.LabelsRemoved++;
             }
             return;
         }
@@ -184,47 +177,43 @@ internal static class Mutations
         if (key < 0) return;
         if (target.Kind == ValueKind.Node && !store.NodeAlive(target.EntityId)) return;
         if (target.Kind == ValueKind.Relationship && !store.RelAlive(target.EntityId)) return;
-        var props = PropsOf(ctx, target);
-        if (props is null || !props.TryGet(key, out _)) return;
+        var cur = target.Kind == ValueKind.Node ? store.NodeProp(target.EntityId, key) : store.RelProp(target.EntityId, key);
+        if (cur.IsNull) return;
         SetProp(ctx, target, key, Value.Null);
     }
 
     public static void Delete(ExecContext ctx, in Value v, bool detach)
     {
         var store = ctx.Store;
-        var log = ctx.WriteLog;
         switch (v.Kind)
         {
             case ValueKind.Null: return;
             case ValueKind.Relationship:
                 if (store.RelAlive(v.EntityId))
                 {
-                    store.DeleteRel(v.EntityId, log);
+                    store.DeleteRel(v.EntityId);
                     ctx.Stats.RelationshipsDeleted++;
                 }
                 return;
             case ValueKind.Node:
                 {
-                    int id = v.EntityId;
+                    long id = v.EntityId;
                     if (!store.NodeAlive(id)) return;
-                    ref var n = ref store.Nodes[id];
                     if (detach)
                     {
-                        var rels = new List<int>(n.Out.Count + n.In.Count);
-                        foreach (var e in n.Out.Span) rels.Add(e.Rel);
-                        foreach (var e in n.In.Span) rels.Add(e.Rel);
-                        foreach (var r in rels)
+                        foreach (var r in store.NodeRels(id))
                         {
                             if (!store.RelAlive(r)) continue;
-                            store.DeleteRel(r, log);
+                            store.DeleteRel(r);
                             ctx.Stats.RelationshipsDeleted++;
                         }
                     }
-                    else if (n.Out.Count > 0 || n.In.Count > 0)
+                    else
                     {
-                        (ctx.PendingNodeDeletes ??= new HashSet<int>()).Add(id);
+                        var (o, i) = store.Degree(id);
+                        if (o > 0 || i > 0) (ctx.PendingNodeDeletes ??= new HashSet<long>()).Add(id);
                     }
-                    store.DeleteNode(id, log);
+                    store.DeleteNode(id);
                     ctx.Stats.NodesDeleted++;
                     return;
                 }
@@ -267,6 +256,7 @@ internal sealed class MergeOp(Operator input, Operator match, CreateSpec create,
     private readonly CreateSpec create = create;
     private readonly CompiledSetItem[] onCreate = onCreate;
     private readonly CompiledSetItem[] onMatch = onMatch;
+
     public override string Name => "Merge";
     public override IEnumerable<Operator> Children => [Input, match];
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);

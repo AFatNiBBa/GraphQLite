@@ -7,7 +7,7 @@ namespace GraphDb.Storage;
 /// <item>Writer-preferring: once a writer announces itself new readers wait, so writers never starve.</item>
 /// <item>Not thread-affine: a transaction may be released from a different thread than the one that opened it.</item>
 /// </list>
-/// Writers must be serialized externally (the database uses a writer gate semaphore).
+/// Used to give checkpoints exclusive access: transactions themselves never take it exclusively.
 /// </summary>
 internal sealed class RwLock : IDisposable
 {
@@ -50,6 +50,26 @@ internal sealed class RwLock : IDisposable
             _writerGo.Reset();
             if ((Volatile.Read(ref _state) & ReaderMask) == 0) return;
             _writerGo.Wait();
+        }
+    }
+
+    /// <summary>Like <see cref="EnterWrite"/> but gives up (and lets readers in again) after the timeout.</summary>
+    public bool TryEnterWrite(int timeoutMs)
+    {
+        _readersGo.Reset();
+        Interlocked.Or(ref _state, WriterBit);
+        long deadline = Environment.TickCount64 + timeoutMs;
+        while (true)
+        {
+            _writerGo.Reset();
+            if ((Volatile.Read(ref _state) & ReaderMask) == 0) return true;
+            long left = deadline - Environment.TickCount64;
+            if (left <= 0 || !_writerGo.Wait((int)left))
+            {
+                if ((Volatile.Read(ref _state) & ReaderMask) == 0) return true;
+                ExitWrite();
+                return false;
+            }
         }
     }
 

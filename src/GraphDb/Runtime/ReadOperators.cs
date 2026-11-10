@@ -1,12 +1,14 @@
-using GraphDb.Cypher;
+using System.Numerics;
 using System.Runtime.CompilerServices;
+using GraphDb.Cypher;
 using GraphDb.Storage;
 
 namespace GraphDb.Runtime;
 
 internal static class LabelUtil
 {
-    public static int[]? Resolve(TokenRef[] labels, GraphStore store, out bool impossible)
+    /// <summary>Resolves label tokens; <paramref name="impossible"/> when one of them does not exist yet.</summary>
+    public static int[]? Resolve(TokenRef[] labels, StoreTx store, out bool impossible)
     {
         impossible = false;
         if (labels.Length == 0) return null;
@@ -20,10 +22,10 @@ internal static class LabelUtil
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool HasAll(ref NodeRecord n, int[]? labels)
+    public static bool HasAll(StoreTx tx, long node, int[]? labels)
     {
         if (labels is null) return true;
-        foreach (var l in labels) if (!n.HasLabel(l)) return false;
+        foreach (var l in labels) if (!tx.HasLabel(node, l)) return false;
         return true;
     }
 
@@ -32,7 +34,7 @@ internal static class LabelUtil
 
 // ====================================================================== scans
 
-internal sealed class AllNodesScanOp(Operator input, int slot, string variable) : UnaryOperator(input)
+internal sealed unsafe class AllNodesScanOp(Operator input, int slot, string variable) : UnaryOperator(input)
 {
     public override string Name => "AllNodesScan";
     public override string Details => variable;
@@ -40,29 +42,31 @@ internal sealed class AllNodesScanOp(Operator input, int slot, string variable) 
 
     private sealed class C(Cursor input, ExecContext ctx, int slot) : Cursor
     {
-        private int _i, _high;
+        private long _i, _high;
         private bool _active;
 
         public override bool Next()
         {
-            var store = ctx.Store;
+            var tx = ctx.Store;
             while (true)
             {
                 if (!_active)
                 {
                     if (!input.Next()) return false;
                     _i = 0;
-                    _high = store.NodeHigh;
+                    _high = tx.NodeHigh;
                     _active = true;
                 }
-                var nodes = store.Nodes;
                 while (_i < _high)
                 {
-                    int id = _i++;
-                    if (nodes[id].Alive)
+                    long page = _i / NodeRec.PerPage;
+                    byte* p = tx.Page(Space.Nodes, page);
+                    long end = Math.Min(_high, (page + 1) * NodeRec.PerPage);
+                    for (; _i < end; _i++)
                     {
+                        if ((((NodeRec*)(p + (int)(_i % NodeRec.PerPage) * NodeRec.Size))->Flags & NodeRec.InUse) == 0) continue;
                         ctx.CheckCancel();
-                        ctx.Row[slot] = Value.FromNodeId(id);
+                        ctx.Row[slot] = Value.FromNodeId(_i++);
                         return true;
                     }
                 }
@@ -72,135 +76,292 @@ internal sealed class AllNodesScanOp(Operator input, int slot, string variable) 
     }
 }
 
-internal sealed class LabelScanOp(Operator input, int slot, string variable, TokenRef[] labels) : UnaryOperator(input)
+/// <summary>Iterates node ids from label bitmaps: AND of <c>all</c> labels, OR of <c>any</c> labels.</summary>
+internal sealed unsafe class LabelBitmapIterator
 {
-    public override string Name => "NodeByLabelScan";
-    public override string Details => variable + LabelUtil.Format(labels);
-    public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slot, labels);
+    private readonly StoreTx _tx;
+    private readonly long[] _allDirs, _anyDirs;
+    private readonly long[] _allPages, _anyPages;
+    private readonly long _high;
+    private long _group = -1;
+    private int _word = 1024;
+    private ulong _bits;
+    private readonly bool _empty;
 
-    private sealed class C : Cursor
+    public LabelBitmapIterator(StoreTx tx, int[] all, int[] any)
     {
-        private readonly Cursor _input;
-        private readonly ExecContext _ctx;
-        private readonly int _slot;
-        private readonly TokenRef[] _labels;
-        private Bitset? _bits;
-        private int[]? _others;
-        private int _next, _high;
-        private bool _active;
+        _tx = tx;
+        _high = tx.NodeHigh;
+        _allDirs = all.Select(tx.LabelDir).ToArray();
+        _anyDirs = any.Select(tx.LabelDir).ToArray();
+        _allPages = new long[_allDirs.Length];
+        _anyPages = new long[_anyDirs.Length];
+        _empty = (_allDirs.Length == 0 && _anyDirs.Length == 0) || _allDirs.Contains(0) || (_anyDirs.Length > 0 && _anyDirs.All(d => d == 0));
+    }
 
-        public C(Cursor input, ExecContext ctx, int slot, TokenRef[] labels)
+    private bool LoadGroup()
+    {
+        long maxGroup = (_high - 1) >> 16;
+        while (++_group <= maxGroup)
         {
-            _input = input;
-            _ctx = ctx;
-            _slot = slot;
-            _labels = labels;
-        }
-
-        /// <summary>Resolved lazily: labels may be created by earlier clauses of the same query.</summary>
-        private void Resolve()
-        {
-            var ids = LabelUtil.Resolve(_labels, _ctx.Store, out bool impossible);
-            if (impossible || ids is null) return;
-            // drive the scan from the smallest label, check the others
-            int best = 0;
-            for (int i = 1; i < ids.Length; i++)
-                if (_ctx.Store.LabelCount(ids[i]) < _ctx.Store.LabelCount(ids[best])) best = i;
-            _bits = _ctx.Store.LabelBits(ids[best]);
-            if (ids.Length > 1) _others = ids.Where((_, i) => i != best).ToArray();
-        }
-
-        public override bool Next()
-        {
-            var store = _ctx.Store;
-            while (true)
+            bool ok = true;
+            for (int i = 0; i < _allDirs.Length; i++)
             {
-                if (!_active)
+                _allPages[i] = _tx.LabelBitmapPage(_allDirs[i], _group);
+                if (_allPages[i] == 0) ok = false;
+            }
+            bool anyOk = _anyDirs.Length == 0;
+            for (int i = 0; i < _anyDirs.Length; i++)
+            {
+                _anyPages[i] = _anyDirs[i] == 0 ? 0 : _tx.LabelBitmapPage(_anyDirs[i], _group);
+                if (_anyPages[i] != 0) anyOk = true;
+            }
+            if (ok && anyOk)
+            {
+                _word = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public bool Next(out long id)
+    {
+        id = -1;
+        if (_empty) return false;
+        while (true)
+        {
+            if (_bits != 0)
+            {
+                int bit = BitOperations.TrailingZeroCount(_bits);
+                _bits &= _bits - 1;
+                id = (_group << 16) | ((long)(_word - 1) << 6) | (uint)bit;
+                if (id >= _high) return false;
+                return true;
+            }
+            if (_word >= 1024 && !LoadGroup()) return false;
+            while (_word < 1024)
+            {
+                int w = _word++;
+                ulong bits = ulong.MaxValue;
+                for (int i = 0; i < _allPages.Length; i++) bits &= ((ulong*)_tx.ReadPage(_allPages[i]))[w];
+                if (_anyPages.Length > 0)
                 {
-                    if (!_input.Next()) return false;
-                    if (_bits is null)
-                    {
-                        Resolve();
-                        if (_bits is null) continue;
-                    }
-                    _next = 0;
-                    _high = store.NodeHigh;
-                    _active = true;
+                    ulong any = 0;
+                    for (int i = 0; i < _anyPages.Length; i++)
+                        if (_anyPages[i] != 0) any |= ((ulong*)_tx.ReadPage(_anyPages[i]))[w];
+                    bits &= any;
                 }
-                while (true)
+                if (bits != 0)
                 {
-                    int id = _bits!.NextSetBit(_next);
-                    if (id < 0 || id >= _high) break;
-                    _next = id + 1;
-                    if (_others != null && !LabelUtil.HasAll(ref store.Nodes[id], _others)) continue;
-                    _ctx.CheckCancel();
-                    _ctx.Row[_slot] = Value.FromNodeId(id);
-                    return true;
+                    _bits = bits;
+                    break;
                 }
-                _active = false;
             }
         }
     }
 }
 
-/// <summary>Seeks nodes through a (label, property) hash index; value may be a single value or a list (IN).</summary>
-internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable, TokenRef[] labels, TokenRef label, TokenRef key, Eval value, bool isList)
-    : UnaryOperator(input)
+/// <summary>Label scan: nodes having all labels of <c>all</c> and at least one of <c>any</c>.</summary>
+internal sealed class LabelScanOp(Operator input, int slot, string variable, TokenRef[] all, TokenRef[] any) : UnaryOperator(input)
+{
+    public override string Name => "NodeByLabelScan";
+    public override string Details => variable + LabelUtil.Format(all) + (any.Length > 0 ? ":(" + string.Join("|", any.Select(a => a.Name)) + ")" : "");
+    public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
+
+    private sealed class C(LabelScanOp op, Cursor input, ExecContext ctx) : Cursor
+    {
+        private LabelBitmapIterator? _it;
+
+        public override bool Next()
+        {
+            while (true)
+            {
+                if (_it != null && _it.Next(out long id))
+                {
+                    ctx.CheckCancel();
+                    ctx.Row[op.slot] = Value.FromNodeId(id);
+                    return true;
+                }
+                if (!input.Next()) return false;
+                // resolved per input row: labels may be created by earlier clauses of the same query
+                var all = LabelUtil.Resolve(op.all, ctx.Store, out bool impossible) ?? [];
+                if (impossible) { _it = null; continue; }
+                var any = op.any.Select(t => t.Resolve(ctx.Store)).Where(x => x >= 0).ToArray();
+                if (op.any.Length > 0 && any.Length == 0) { _it = null; continue; }
+                _it = new LabelBitmapIterator(ctx.Store, all, any);
+            }
+        }
+    }
+
+    private readonly int slot = slot;
+    private readonly TokenRef[] all = all;
+    private readonly TokenRef[] any = any;
+}
+
+internal enum SeekMode { Equal, In, Range, Prefix }
+
+/// <summary>
+/// Seeks nodes through a (label, property) B+tree index. Falls back to a label scan if the index does not
+/// exist at execution time. Candidates are re-checked by the predicate the planner keeps above this operator.
+/// </summary>
+internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable, TokenRef[] labels, TokenRef label, TokenRef key, SeekMode mode,
+    Eval? value, Eval? low, bool lowInclusive, Eval? high, bool highInclusive, string desc) : UnaryOperator(input)
 {
     private readonly int slot = slot;
     private readonly TokenRef[] labels = labels;
     private readonly TokenRef label = label;
     private readonly TokenRef key = key;
-    private readonly Eval value = value;
-    private readonly bool isList = isList;
-    public override string Name => isList ? "NodeIndexSeek(IN)" : "NodeIndexSeek";
-    public override string Details => $"{variable}{LabelUtil.Format(labels)}({key.Name})";
+    private readonly SeekMode mode = mode;
+    private readonly Eval? value = value;
+    private readonly Eval? low = low;
+    private readonly bool lowInclusive = lowInclusive;
+    private readonly Eval? high = high;
+    private readonly bool highInclusive = highInclusive;
 
+    public override string Name => mode switch
+    {
+        SeekMode.In => "NodeIndexSeek(IN)",
+        SeekMode.Range => "NodeIndexSeekByRange",
+        SeekMode.Prefix => "NodeIndexSeekByPrefix",
+        _ => "NodeIndexSeek",
+    };
+
+    public override string Details => $"{variable}{LabelUtil.Format(labels)}({key.Name}) {desc}";
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
     private sealed class C(NodeIndexSeekOp op, Cursor input, ExecContext ctx) : Cursor
     {
-        private readonly List<int> _ids = new();
-        private int _pos;
+        private readonly Queue<(byte[] Low, byte[]? High)> _ranges = new();
+        private IndexRangeCursor? _cur;
+        private LabelBitmapIterator? _fallback;
+        private HashSet<long>? _seen;
         private int[]? _labels;
-        private bool _resolved, _impossible;
+        private readonly BinWriter _w = new(64);
+
+        private byte[]? Encode(in Value v)
+        {
+            _w.Reset();
+            return IndexKeys.EncodeValue(v, _w) ? _w.Written.ToArray() : null;
+        }
+
+        private void Plan()
+        {
+            _ranges.Clear();
+            _seen = null;
+            switch (op.mode)
+            {
+                case SeekMode.Equal:
+                    {
+                        var k = Encode(op.value!(ctx));
+                        if (k != null) _ranges.Enqueue((k, IndexKeys.Successor(k)));
+                        break;
+                    }
+                case SeekMode.In:
+                    {
+                        var v = op.value!(ctx);
+                        if (v.Kind != ValueKind.List) break;
+                        var keys = new HashSet<string>();
+                        foreach (var x in v.ListItems)
+                        {
+                            var k = Encode(x);
+                            if (k != null && keys.Add(Convert.ToBase64String(k))) _ranges.Enqueue((k, IndexKeys.Successor(k)));
+                        }
+                        if (_ranges.Count > 1) _seen = new HashSet<long>();
+                        break;
+                    }
+                case SeekMode.Prefix:
+                    {
+                        var v = op.value!(ctx);
+                        if (v.Kind != ValueKind.String) break;
+                        _w.Reset();
+                        _w.WriteByte(IndexKeys.TString);
+                        IndexKeys.WriteEscaped(_w, v.Str, terminate: false);
+                        var k = _w.Written.ToArray();
+                        _ranges.Enqueue((k, IndexKeys.Successor(k)));
+                        break;
+                    }
+                case SeekMode.Range:
+                    {
+                        Value lo = op.low?.Invoke(ctx) ?? Value.Null, hi = op.high?.Invoke(ctx) ?? Value.Null;
+                        if (op.low != null && lo.IsNull || op.high != null && hi.IsNull) break;
+                        var any = op.low != null ? lo : hi;
+                        byte tag = IndexKeys.TagOf(any.Kind);
+                        if (tag == 0) break;
+                        if (op.low != null && op.high != null && IndexKeys.TagOf(hi.Kind) != tag) break;
+                        byte[] lowKey;
+                        if (op.low is null) lowKey = [tag];
+                        else
+                        {
+                            var k = Encode(lo);
+                            if (k is null) break;
+                            lowKey = op.lowInclusive ? k : IndexKeys.Successor(k) ?? k;
+                        }
+                        byte[]? highKey;
+                        if (op.high is null) highKey = [(byte)(tag + 1)];
+                        else
+                        {
+                            var k = Encode(hi);
+                            if (k is null) break;
+                            highKey = op.highInclusive ? IndexKeys.Successor(k) : k;
+                        }
+                        _ranges.Enqueue((lowKey, highKey));
+                        break;
+                    }
+            }
+        }
+
+        private bool Accept(long id)
+        {
+            var tx = ctx.Store;
+            if (!tx.NodeAlive(id) || !LabelUtil.HasAll(tx, id, _labels)) return false;
+            return _seen is null || _seen.Add(id);
+        }
 
         public override bool Next()
         {
-            var store = ctx.Store;
+            var tx = ctx.Store;
             while (true)
             {
-                while (_pos < _ids.Count)
+                if (_fallback != null)
                 {
-                    int id = _ids[_pos++];
-                    if (!store.NodeAlive(id) || !LabelUtil.HasAll(ref store.Nodes[id], _labels)) continue;
-                    ctx.Row[op.slot] = Value.FromNodeId(id);
-                    return true;
+                    while (_fallback.Next(out long fid))
+                    {
+                        if (!Accept(fid)) continue;
+                        ctx.Row[op.slot] = Value.FromNodeId(fid);
+                        return true;
+                    }
+                    _fallback = null;
+                }
+                while (_cur != null || _ranges.Count > 0)
+                {
+                    if (_cur is null)
+                    {
+                        var (lo, hi) = _ranges.Dequeue();
+                        _cur = tx.IndexScan(op.label.Resolve(tx), op.key.Resolve(tx), lo, hi);
+                        if (_cur is null) continue;
+                    }
+                    while (_cur.Next(out long id))
+                    {
+                        if (!Accept(id)) continue;
+                        ctx.CheckCancel();
+                        ctx.Row[op.slot] = Value.FromNodeId(id);
+                        return true;
+                    }
+                    _cur = null;
                 }
                 if (!input.Next()) return false;
-                _ids.Clear();
-                _pos = 0;
-                if (!_resolved)
+                _labels = LabelUtil.Resolve(op.labels, tx, out bool impossible);
+                if (impossible) continue;
+                int lid = op.label.Resolve(tx), kid = op.key.Resolve(tx);
+                if (lid < 0 || kid < 0) continue;
+                if (tx.Catalog.Find(lid, kid) is null)
                 {
-                    _labels = LabelUtil.Resolve(op.labels, store, out _impossible);
-                    if (_impossible) continue;
-                    _resolved = true;
+                    // index dropped after planning: label scan, the predicate above re-checks values
+                    _fallback = new LabelBitmapIterator(tx, [lid], []);
+                    continue;
                 }
-                var ix = store.FindIndex(op.label.Resolve(store), op.key.Resolve(store));
-                var v = op.value(ctx);
-                if (ix is null) continue;
-                if (!op.isList) ix.Lookup(v, _ids);
-                else if (v.Kind == ValueKind.List)
-                {
-                    var items = v.ListItems;
-                    foreach (var x in items) ix.Lookup(x, _ids);
-                    if (items.Length > 1 && _ids.Count > 1)
-                    {
-                        var distinct = new HashSet<int>(_ids);
-                        _ids.Clear();
-                        _ids.AddRange(distinct);
-                    }
-                }
+                Plan();
             }
         }
     }
@@ -226,15 +387,14 @@ internal sealed class NodeByIdSeekOp(Operator input, int slot, string variable, 
                     while (_pos < _list.Length)
                     {
                         var v = _list[_pos++];
-                        if (v.Kind != ValueKind.Integer || v.Num < 0 || v.Num > int.MaxValue) continue;
-                        if (!ctx.Store.NodeAlive((int)v.Num)) continue;
-                        ctx.Row[slot] = Value.FromNodeId((int)v.Num);
+                        if (v.Kind != ValueKind.Integer || !ctx.Store.NodeAlive(v.Num)) continue;
+                        ctx.Row[slot] = Value.FromNodeId(v.Num);
                         return true;
                     }
                 }
                 if (!input.Next()) return false;
                 var x = ids(ctx);
-                _list = x.Kind == ValueKind.List ? x.ListItems : [x];
+                _list = x.Kind == ValueKind.List ? x.ListItems.Distinct(ValueEquivalenceComparer.Instance).ToArray() : [x];
                 _pos = 0;
             }
         }
@@ -247,7 +407,7 @@ internal static class RelCheck
 {
     /// <summary>Relationship-isomorphism check against relationships already bound in the same MATCH.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool IsUsed(Value[] row, int[] slots, int rel)
+    public static bool IsUsed(Value[] row, int[] slots, long rel)
     {
         foreach (var s in slots)
         {
@@ -272,13 +432,13 @@ internal static class RelCheck
         return false;
     }
 
-    public static bool AllResolved(TokenRef[] tokens, GraphStore store)
+    public static bool AllResolved(TokenRef[] tokens, StoreTx store)
     {
         foreach (var t in tokens) if (t.Resolve(store) < 0) return false;
         return true;
     }
 
-    public static int[]? ResolveTypes(TokenRef[] types, GraphStore store, out bool impossible)
+    public static int[]? ResolveTypes(TokenRef[] types, StoreTx store, out bool impossible)
     {
         impossible = false;
         if (types.Length == 0) return null;
@@ -290,6 +450,38 @@ internal static class RelCheck
         }
         if (list.Count == 0) impossible = true;
         return list.ToArray();
+    }
+}
+
+/// <summary>Iterates adjacency entries of one node block by block, re-fetching page memory on every call.</summary>
+internal unsafe struct AdjWalker
+{
+    public long Block;
+    public int Idx;
+
+    public void Start(StoreTx tx, long node, bool outgoing)
+    {
+        Block = tx.AdjHead(node, outgoing);
+        Idx = 0;
+    }
+
+    /// <summary>Returns the next entry, or false at the end.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool Next(StoreTx tx, out AdjEntry e)
+    {
+        while (Block != 0)
+        {
+            var b = (AdjBlock*)tx.R(Block);
+            if (Idx < b->Count)
+            {
+                e = StoreTx.Entries((byte*)b)[Idx++];
+                return true;
+            }
+            Block = b->Next;
+            Idx = 0;
+        }
+        e = default;
+        return false;
     }
 }
 
@@ -305,64 +497,45 @@ internal sealed class ExpandOp(Operator input, int fromSlot, int relSlot, int to
     private readonly TokenRef[] toLabels = toLabels;
     private readonly bool into = into;
     private readonly int[] uniqueSlots = uniqueSlots;
+
     public override string Name => into ? "ExpandInto" : "Expand";
     public override string Details => desc;
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
-    private sealed class C : Cursor
+    private sealed class C(ExpandOp op, Cursor input, ExecContext ctx) : Cursor
     {
-        private readonly ExpandOp _op;
-        private readonly Cursor _input;
-        private readonly ExecContext _ctx;
         private int[]? _types;
         private int[]? _labels;
         private bool _impossible, _complete;
-        private AdjEntry[]? _items;
-        private int _count, _idx, _from, _target;
+        private AdjWalker _walk;
+        private long _from, _target;
         private byte _phase; // 0 = out, 1 = in
         private bool _active;
 
-        public C(ExpandOp op, Cursor input, ExecContext ctx)
-        {
-            _op = op;
-            _input = input;
-            _ctx = ctx;
-        }
-
         private void Resolve()
         {
-            _types = RelCheck.ResolveTypes(_op.types, _ctx.Store, out bool i1);
-            _labels = LabelUtil.Resolve(_op.toLabels, _ctx.Store, out bool i2);
+            _types = RelCheck.ResolveTypes(op.types, ctx.Store, out bool i1);
+            _labels = LabelUtil.Resolve(op.toLabels, ctx.Store, out bool i2);
             _impossible = i1 || i2;
-            _complete = RelCheck.AllResolved(_op.types, _ctx.Store) && !i2;
-        }
-
-        private void Load()
-        {
-            ref var n = ref _ctx.Store.Nodes[_from];
-            ref var list = ref _phase == 0 ? ref n.Out : ref n.In;
-            _items = list.Items;
-            _count = list.Count;
-            _idx = 0;
+            _complete = RelCheck.AllResolved(op.types, ctx.Store) && !i2;
         }
 
         public override bool Next()
         {
-            var op = _op;
-            var row = _ctx.Row;
-            var store = _ctx.Store;
+            var row = ctx.Row;
+            var tx = ctx.Store;
             while (true)
             {
                 if (!_active)
                 {
-                    if (!_input.Next()) return false;
+                    if (!input.Next()) return false;
                     if (!_complete)
                     {
                         Resolve();
                         if (_impossible) continue;
                     }
                     var from = row[op.fromSlot];
-                    if (from.Kind != ValueKind.Node || !store.NodeAlive(from.EntityId)) continue;
+                    if (from.Kind != ValueKind.Node || !tx.NodeAlive(from.EntityId)) continue;
                     _from = from.EntityId;
                     if (op.into)
                     {
@@ -371,30 +544,28 @@ internal sealed class ExpandOp(Operator input, int fromSlot, int relSlot, int to
                         _target = to.EntityId;
                     }
                     _phase = op.dir == Direction.In ? (byte)1 : (byte)0;
-                    Load();
+                    _walk.Start(tx, _from, _phase == 0);
                     _active = true;
                 }
-                var items = _items;
-                while (_idx < _count)
+                while (_walk.Next(tx, out var e))
                 {
-                    ref readonly var e = ref items![_idx++];
                     if (_types != null && !RelCheck.TypeOk(_types, e.Type)) continue;
                     if (_phase == 1 && op.dir == Direction.Both && e.Other == _from) continue; // self loop already seen
                     if (op.into)
                     {
                         if (e.Other != _target) continue;
                     }
-                    else if (_labels != null && !LabelUtil.HasAll(ref store.Nodes[e.Other], _labels)) continue;
+                    else if (_labels != null && !LabelUtil.HasAll(tx, e.Other, _labels)) continue;
                     if (op.uniqueSlots.Length > 0 && RelCheck.IsUsed(row, op.uniqueSlots, e.Rel)) continue;
                     row[op.relSlot] = Value.FromRelId(e.Rel);
                     if (!op.into) row[op.toSlot] = Value.FromNodeId(e.Other);
-                    _ctx.CheckCancel();
+                    ctx.CheckCancel();
                     return true;
                 }
                 if (_phase == 0 && op.dir == Direction.Both)
                 {
                     _phase = 1;
-                    Load();
+                    _walk.Start(tx, _from, false);
                     continue;
                 }
                 _active = false;
@@ -420,111 +591,88 @@ internal sealed class VarExpandOp(Operator input, int fromSlot, int relSlot, int
     private readonly int max = max;
     private readonly (TokenRef Key, Eval Value)[] relFilter = relFilter;
     private readonly bool reverse = reverse;
+
     public override string Name => into ? "VarLengthExpandInto" : "VarLengthExpand";
     public override string Details => desc;
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
     private struct Frame
     {
-        public int Node;
-        public AdjEntry[]? Items;
-        public int Count;
-        public int Idx;
+        public long Node;
+        public AdjWalker Walk;
         public byte Phase;
     }
 
-    private sealed class C : Cursor
+    private sealed class C(VarExpandOp op, Cursor input, ExecContext ctx) : Cursor
     {
-        private readonly VarExpandOp _op;
-        private readonly Cursor _input;
-        private readonly ExecContext _ctx;
         private int[]? _types;
         private int[]? _labels;
         private bool _impossible, _complete;
         private readonly List<Frame> _stack = new();
-        private readonly List<int> _path = new();
+        private readonly List<long> _path = new();
         private Value[]? _filterValues;
         private bool _active, _pendingZero;
-        private int _from, _target;
-
-        public C(VarExpandOp op, Cursor input, ExecContext ctx)
-        {
-            _op = op;
-            _input = input;
-            _ctx = ctx;
-        }
+        private long _from, _target;
 
         private void Resolve()
         {
-            _types = RelCheck.ResolveTypes(_op.types, _ctx.Store, out bool i1);
-            _labels = LabelUtil.Resolve(_op.toLabels, _ctx.Store, out bool i2);
-            _impossible = (i1 && _op.min > 0) || i2;
-            _complete = RelCheck.AllResolved(_op.types, _ctx.Store) && !i2;
+            _types = RelCheck.ResolveTypes(op.types, ctx.Store, out bool i1);
+            _labels = LabelUtil.Resolve(op.toLabels, ctx.Store, out bool i2);
+            _impossible = (i1 && op.min > 0) || i2;
+            _complete = RelCheck.AllResolved(op.types, ctx.Store) && !i2;
         }
 
-        private Frame MakeFrame(int node)
+        private Frame MakeFrame(long node)
         {
-            var f = new Frame { Node = node, Phase = _op.dir == Direction.In ? (byte)1 : (byte)0 };
-            LoadFrame(ref f);
+            var f = new Frame { Node = node, Phase = op.dir == Direction.In ? (byte)1 : (byte)0 };
+            f.Walk.Start(ctx.Store, node, f.Phase == 0);
             return f;
         }
 
-        private void LoadFrame(ref Frame f)
+        private bool TargetOk(long node)
         {
-            ref var n = ref _ctx.Store.Nodes[f.Node];
-            ref var list = ref f.Phase == 0 ? ref n.Out : ref n.In;
-            f.Items = list.Items;
-            f.Count = list.Count;
-            f.Idx = 0;
+            if (op.into) return node == _target;
+            return _labels is null || LabelUtil.HasAll(ctx.Store, node, _labels);
         }
 
-        private bool TargetOk(int node)
+        private bool RelOk(long rel)
         {
-            if (_op.into) return node == _target;
-            return _labels is null || LabelUtil.HasAll(ref _ctx.Store.Nodes[node], _labels);
-        }
-
-        private bool RelOk(int rel)
-        {
-            var f = _op.relFilter;
-            if (f.Length == 0) return true;
-            var props = _ctx.Store.Rels[rel].Props;
+            var f = op.relFilter;
             for (int i = 0; i < f.Length; i++)
             {
-                int key = f[i].Key.Resolve(_ctx.Store);
-                var actual = key >= 0 && props != null ? props.Get(key) : Value.Null;
+                var actual = ctx.Store.RelProp(rel, f[i].Key.Resolve(ctx.Store));
                 if (!ValueOps.IsTrue(ValueOps.Equal(actual, _filterValues![i]))) return false;
             }
             return true;
         }
 
-        private void Emit(int node)
+        private void Emit(long node)
         {
             var arr = new Value[_path.Count];
-            if (_op.reverse)
+            if (op.reverse)
                 for (int i = 0; i < arr.Length; i++) arr[i] = Value.FromRelId(_path[_path.Count - 1 - i]);
             else
                 for (int i = 0; i < arr.Length; i++) arr[i] = Value.FromRelId(_path[i]);
-            _ctx.Row[_op.relSlot] = Value.FromList(arr);
-            if (!_op.into) _ctx.Row[_op.toSlot] = Value.FromNodeId(node);
+            ctx.Row[op.relSlot] = Value.FromList(arr);
+            if (!op.into) ctx.Row[op.toSlot] = Value.FromNodeId(node);
         }
 
         public override bool Next()
         {
-            var op = _op;
-            var row = _ctx.Row;
+            var row = ctx.Row;
+            var tx = ctx.Store;
             while (true)
             {
                 if (!_active)
                 {
-                    if (!_input.Next()) return false;
+                    if (!input.Next()) return false;
                     if (!_complete)
                     {
                         Resolve();
                         if (_impossible) continue;
                     }
                     var from = row[op.fromSlot];
-                    if (from.Kind != ValueKind.Node || !_ctx.Store.NodeAlive(from.EntityId)) continue;
+                    if (from.Kind != ValueKind.Node || !tx.NodeAlive(from.EntityId)) continue;
                     _from = from.EntityId;
                     if (op.into)
                     {
@@ -535,7 +683,7 @@ internal sealed class VarExpandOp(Operator input, int fromSlot, int relSlot, int
                     if (op.relFilter.Length > 0)
                     {
                         _filterValues ??= new Value[op.relFilter.Length];
-                        for (int i = 0; i < op.relFilter.Length; i++) _filterValues[i] = op.relFilter[i].Value(_ctx);
+                        for (int i = 0; i < op.relFilter.Length; i++) _filterValues[i] = op.relFilter[i].Value(ctx);
                     }
                     _stack.Clear();
                     _path.Clear();
@@ -554,28 +702,27 @@ internal sealed class VarExpandOp(Operator input, int fromSlot, int relSlot, int
                 }
                 while (_stack.Count > 0)
                 {
-                    _ctx.CheckCancel();
+                    ctx.CheckCancel();
                     int top = _stack.Count - 1;
                     var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_stack);
                     ref var f = ref span[top];
-                    if (f.Idx >= f.Count)
+                    if (!f.Walk.Next(tx, out var e))
                     {
                         if (f.Phase == 0 && op.dir == Direction.Both)
                         {
                             f.Phase = 1;
-                            LoadFrame(ref f);
+                            f.Walk.Start(tx, f.Node, false);
                             continue;
                         }
                         _stack.RemoveAt(top);
                         if (_path.Count > 0 && top > 0) _path.RemoveAt(_path.Count - 1);
                         continue;
                     }
-                    var e = f.Items![f.Idx++];
                     if (_types != null && !RelCheck.TypeOk(_types, e.Type)) continue;
                     if (f.Phase == 1 && op.dir == Direction.Both && e.Other == f.Node) continue;
                     if (_path.Contains(e.Rel)) continue;
                     if (op.uniqueSlots.Length > 0 && RelCheck.IsUsed(row, op.uniqueSlots, e.Rel)) continue;
-                    if (!RelOk(e.Rel)) continue;
+                    if (op.relFilter.Length > 0 && !RelOk(e.Rel)) continue;
                     _path.Add(e.Rel);
                     int depth = _path.Count;
                     bool emit = depth >= op.min && TargetOk(e.Other);
@@ -590,7 +737,7 @@ internal sealed class VarExpandOp(Operator input, int fromSlot, int relSlot, int
     }
 }
 
-/// <summary>shortestPath / allShortestPaths between two bound nodes (BFS).</summary>
+/// <summary>shortestPath / allShortestPaths between two bound nodes (BFS; bidirectional for a single path).</summary>
 internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, int relSlot, int pathSlot, Direction dir, TokenRef[] types,
     int min, int max, bool all) : UnaryOperator(input)
 {
@@ -603,15 +750,17 @@ internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, i
     private readonly int min = min;
     private readonly int max = max;
     private readonly bool all = all;
+
     public override string Name => all ? "AllShortestPaths" : "ShortestPath";
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
     private sealed class C(ShortestPathOp op, Cursor input, ExecContext ctx) : Cursor
     {
-        private readonly List<(int[] Nodes, int[] Rels)> _results = new();
+        private readonly List<(long[] Nodes, long[] Rels)> _results = new();
         private int _pos;
         private int[]? _types;
         private bool _resolved, _impossible;
+        private readonly List<AdjEntry> _adj = new();
 
         public override bool Next()
         {
@@ -643,62 +792,69 @@ internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, i
             }
         }
 
-        /// <summary>Bidirectional BFS: expands the smaller frontier each level (≈ O(b^(d/2)) instead of O(b^d)).</summary>
-        private void SearchBidirectional(int src, int dst)
+        /// <summary>Neighbours of a node in the given direction (self loops reported once).</summary>
+        private List<AdjEntry> Neighbours(long n, Direction dir)
         {
-            var store = ctx.Store;
-            var fwd = new Dictionary<int, (int Prev, int Rel)> { [src] = (-1, -1) };
-            var bwd = new Dictionary<int, (int Next, int Rel)> { [dst] = (-1, -1) };
-            var fFrontier = new List<int> { src };
-            var bFrontier = new List<int> { dst };
-            var next = new List<int>();
+            _adj.Clear();
+            var tx = ctx.Store;
+            var w = new AdjWalker();
+            if (dir != Direction.In)
+            {
+                w.Start(tx, n, true);
+                while (w.Next(tx, out var e)) if (RelCheck.TypeOk(_types, e.Type)) _adj.Add(e);
+            }
+            if (dir != Direction.Out)
+            {
+                w.Start(tx, n, false);
+                while (w.Next(tx, out var e))
+                    if (RelCheck.TypeOk(_types, e.Type) && !(dir == Direction.Both && e.Other == n)) _adj.Add(e);
+            }
+            return _adj;
+        }
+
+        private void SearchBidirectional(long src, long dst)
+        {
+            var fwd = new Dictionary<long, (long Prev, long Rel)> { [src] = (-1, -1) };
+            var bwd = new Dictionary<long, (long Next, long Rel)> { [dst] = (-1, -1) };
+            var fFrontier = new List<long> { src };
+            var bFrontier = new List<long> { dst };
+            var next = new List<long>();
             int maxLen = op.max < 0 ? int.MaxValue : op.max;
             int len = 0;
-            int meet = -1;
-            var fdir = op.dir;
+            long meet = -1;
             var bdir = op.dir switch { Direction.Out => Direction.In, Direction.In => Direction.Out, _ => Direction.Both };
             while (meet < 0 && len < maxLen && fFrontier.Count > 0 && bFrontier.Count > 0)
             {
                 len++;
                 bool forward = fFrontier.Count <= bFrontier.Count;
                 var frontier = forward ? fFrontier : bFrontier;
-                var dir = forward ? fdir : bdir;
                 next.Clear();
                 foreach (var n in frontier)
                 {
                     ctx.CheckCancel();
-                    ref var rec = ref store.Nodes[n];
-                    if (dir != Direction.In && Visit(rec.Out.Span, n, false)) break;
-                    if (dir != Direction.Out && Visit(rec.In.Span, n, dir == Direction.Both)) break;
-                }
-                if (forward) (fFrontier, next) = (next, fFrontier);
-                else (bFrontier, next) = (next, bFrontier);
-
-                bool Visit(ReadOnlySpan<AdjEntry> adj, int n, bool skipSelf)
-                {
-                    foreach (var e in adj)
+                    foreach (var e in Neighbours(n, forward ? op.dir : bdir))
                     {
-                        if (_types != null && !RelCheck.TypeOk(_types, e.Type)) continue;
-                        if (skipSelf && e.Other == n) continue;
                         if (forward)
                         {
                             if (!fwd.TryAdd(e.Other, (n, e.Rel))) continue;
-                            if (bwd.ContainsKey(e.Other)) { meet = e.Other; return true; }
+                            if (bwd.ContainsKey(e.Other)) { meet = e.Other; break; }
                         }
                         else
                         {
                             if (!bwd.TryAdd(e.Other, (n, e.Rel))) continue;
-                            if (fwd.ContainsKey(e.Other)) { meet = e.Other; return true; }
+                            if (fwd.ContainsKey(e.Other)) { meet = e.Other; break; }
                         }
                         next.Add(e.Other);
                     }
-                    return false;
+                    if (meet >= 0) break;
                 }
+                if (forward) (fFrontier, next) = (next, fFrontier);
+                else (bFrontier, next) = (next, bFrontier);
             }
             if (meet < 0 || len < op.min) return;
-            var nodes = new List<int>();
-            var rels = new List<int>();
-            for (int cur = meet; cur != src;)
+            var nodes = new List<long>();
+            var rels = new List<long>();
+            for (long cur = meet; cur != src;)
             {
                 var (prev, rel) = fwd[cur];
                 nodes.Add(cur);
@@ -708,7 +864,7 @@ internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, i
             nodes.Add(src);
             nodes.Reverse();
             rels.Reverse();
-            for (int cur = meet; cur != dst;)
+            for (long cur = meet; cur != dst;)
             {
                 var (nx, rel) = bwd[cur];
                 rels.Add(rel);
@@ -718,40 +874,28 @@ internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, i
             _results.Add((nodes.ToArray(), rels.ToArray()));
         }
 
-        private void Search(int src, int dst)
+        private void Search(long src, long dst)
         {
             if (src == dst)
             {
                 if (op.min == 0) _results.Add(([src], []));
                 return;
             }
-            var store = ctx.Store;
-            // parents: node -> list of (prevNode, rel) at shortest distance
-            var parents = new Dictionary<int, List<(int Prev, int Rel)>>();
-            var depthOf = new Dictionary<int, int> { [src] = 0 };
-            var frontier = new List<int> { src };
+            var parents = new Dictionary<long, List<(long Prev, long Rel)>>();
+            var depthOf = new Dictionary<long, int> { [src] = 0 };
+            var frontier = new List<long> { src };
             int depth = 0;
             bool found = false;
             int maxDepth = op.max < 0 ? int.MaxValue : op.max;
             while (frontier.Count > 0 && !found && depth < maxDepth)
             {
                 depth++;
-                var next = new List<int>();
+                var next = new List<long>();
                 foreach (var n in frontier)
                 {
                     ctx.CheckCancel();
-                    ref var rec = ref store.Nodes[n];
-                    if (op.dir != Direction.In) Visit(rec.Out.Span, n, false);
-                    if (op.dir != Direction.Out) Visit(rec.In.Span, n, op.dir == Direction.Both);
-                }
-                frontier = next;
-
-                void Visit(ReadOnlySpan<AdjEntry> adj, int n, bool skipSelf)
-                {
-                    foreach (var e in adj)
+                    foreach (var e in Neighbours(n, op.dir))
                     {
-                        if (_types != null && !RelCheck.TypeOk(_types, e.Type)) continue;
-                        if (skipSelf && e.Other == n) continue;
                         if (depthOf.TryGetValue(e.Other, out var d))
                         {
                             if (d == depth && op.all) parents[e.Other].Add((n, e.Rel));
@@ -763,14 +907,14 @@ internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, i
                         next.Add(e.Other);
                     }
                 }
+                frontier = next;
             }
             if (!found || depth < op.min) return;
-            // reconstruct (all) paths backwards
-            var relStack = new List<int>();
-            var nodeStack = new List<int> { dst };
+            var relStack = new List<long>();
+            var nodeStack = new List<long> { dst };
             Walk(dst);
 
-            void Walk(int node)
+            void Walk(long node)
             {
                 if (node == src)
                 {
@@ -801,6 +945,7 @@ internal sealed class BuildPathOp(Operator input, int pathSlot, int[] nodeSlots,
     private readonly int pathSlot = pathSlot;
     private readonly int[] nodeSlots = nodeSlots;
     private readonly int[] relSlots = relSlots;
+
     public override string Name => "ProjectPath";
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
@@ -810,16 +955,13 @@ internal sealed class BuildPathOp(Operator input, int pathSlot, int[] nodeSlots,
         var store = ctx.Store;
         var first = row[nodeSlots[0]];
         if (first.Kind != ValueKind.Node) return Value.Null;
-        var nodes = new List<int> { first.EntityId };
-        var rels = new List<int>();
-        int cur = first.EntityId;
+        var nodes = new List<long> { first.EntityId };
+        var rels = new List<long>();
+        long cur = first.EntityId;
         for (int i = 0; i < relSlots.Length; i++)
         {
             var r = row[relSlots[i]];
-            if (r.Kind == ValueKind.Relationship)
-            {
-                Step(r.EntityId);
-            }
+            if (r.Kind == ValueKind.Relationship) Step(r.EntityId);
             else if (r.Kind == ValueKind.List)
             {
                 foreach (var x in r.ListItems) Step(x.EntityId);
@@ -828,10 +970,10 @@ internal sealed class BuildPathOp(Operator input, int pathSlot, int[] nodeSlots,
         }
         return Value.FromPath(new GraphPath(nodes.ToArray(), rels.ToArray()));
 
-        void Step(int rel)
+        void Step(long rel)
         {
-            ref var rr = ref store.Rels[rel];
-            int other = rr.Src == cur ? rr.Dst : rr.Src;
+            var (src, dst, _) = store.RelInfo(rel);
+            long other = src == cur ? dst : src;
             rels.Add(rel);
             nodes.Add(other);
             cur = other;
@@ -959,6 +1101,66 @@ internal sealed class OptionalOp(Operator input, Operator inner, int[] nullSlots
     }
 }
 
+/// <summary>CALL { subquery }: runs the inner plan for every input row. A unit subquery (no RETURN)
+/// passes each input row through once; with IN TRANSACTIONS the work is committed every N input rows.</summary>
+internal sealed class ApplyOp(Operator input, Operator inner, bool unit, Eval? batchSize) : UnaryOperator(input)
+{
+    private readonly Operator inner = inner;
+    private readonly bool unit = unit;
+    private readonly Eval? batchSize = batchSize;
+
+    public override string Name => batchSize is null ? "Apply" : "TransactionApply";
+    public override IEnumerable<Operator> Children => [Input, inner];
+    public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
+
+    private sealed class C(ApplyOp op, Cursor input, ExecContext ctx) : Cursor
+    {
+        private Cursor? _inner;
+        private long _batch = -1, _inBatch;
+
+        private void AfterInputRow()
+        {
+            if (op.batchSize is null) return;
+            if (_batch < 0)
+            {
+                if (ctx.CommitBatch is null) throw new GraphDbException("CALL { ... } IN TRANSACTIONS can only be used in implicit (auto-commit) transactions");
+                _batch = LimitOp.EvalCount(ctx, op.batchSize, "IN TRANSACTIONS OF");
+                if (_batch <= 0) _batch = 1000;
+            }
+            if (++_inBatch >= _batch)
+            {
+                _inBatch = 0;
+                ctx.CheckPendingDeletes();
+                ctx.CommitBatch!();
+            }
+        }
+
+        public override bool Next()
+        {
+            while (true)
+            {
+                if (_inner != null)
+                {
+                    if (_inner.Next()) return true;
+                    _inner = null;
+                    AfterInputRow();
+                }
+                if (!input.Next()) return false;
+                if (op.unit)
+                {
+                    var saved = RowOps.Snapshot(ctx.Row);
+                    var c = op.inner.Open(ctx);
+                    while (c.Next()) { }
+                    RowOps.Restore(saved, ctx.Row);
+                    AfterInputRow();
+                    return true;
+                }
+                _inner = op.inner.Open(ctx);
+            }
+        }
+    }
+}
+
 internal sealed class SkipOp(Operator input, Eval count) : UnaryOperator(input)
 {
     public override string Name => "Skip";
@@ -1078,6 +1280,7 @@ internal sealed class SortOp(Operator input, SortKey[] keys, Eval? limit) : Unar
 {
     private readonly SortKey[] keys = keys;
     private readonly Eval? limit = limit;
+
     public override string Name => limit is null ? "Sort" : "Top";
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
@@ -1109,14 +1312,12 @@ internal sealed class SortOp(Operator input, SortKey[] keys, Eval? limit) : Unar
                 else
                 {
                     long n = LimitOp.EvalCount(ctx, op.limit, "LIMIT");
-                    // max-heap of the best n rows: the root is the worst kept row
                     var heap = new PriorityQueue<(Value[] Keys, Value[] Row, int Seq), (Value[] Keys, Value[] Row, int Seq)>(
                         Comparer<(Value[], Value[], int)>.Create((a, b) => cmp.Compare(b, a)));
                     while (input.Next())
                     {
                         if (n == 0) continue;
-                        var keys = Keys();
-                        var cand = (keys, (Value[])null!, seq++);
+                        var cand = (Keys(), (Value[])null!, seq++);
                         if (heap.Count < n)
                         {
                             cand.Item2 = RowOps.Snapshot(ctx.Row);
@@ -1145,6 +1346,7 @@ internal sealed class UnionOp(Operator[] branches, int[] columnSlots, bool disti
     private readonly Operator[] branches = branches;
     private readonly int[] columnSlots = columnSlots;
     private readonly bool distinct = distinct;
+
     public override string Name => distinct ? "Union" : "UnionAll";
     public override IEnumerable<Operator> Children => branches;
     public override Cursor Open(ExecContext ctx) => new C(this, ctx);

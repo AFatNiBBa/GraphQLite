@@ -16,12 +16,11 @@ internal sealed class BinWriter
 
     public int Length => _pos;
     public ReadOnlySpan<byte> Written => new(_buf, 0, _pos);
-    public byte[] Buffer => _buf;
+    public Span<byte> WrittenMutable => new(_buf, 0, _pos);
     public void Reset() => _pos = 0;
-    public void Truncate(int length) => _pos = Math.Min(_pos, length);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private Span<byte> Reserve(int n)
+    public Span<byte> Reserve(int n)
     {
         if (_pos + n > _buf.Length) Grow(n);
         var s = new Span<byte>(_buf, _pos, n);
@@ -29,11 +28,7 @@ internal sealed class BinWriter
         return s;
     }
 
-    private void Grow(int n)
-    {
-        int size = Math.Max(_buf.Length * 2, _pos + n);
-        Array.Resize(ref _buf, size);
-    }
+    private void Grow(int n) => Array.Resize(ref _buf, Math.Max(_buf.Length * 2, _pos + n));
 
     public void WriteByte(byte b)
     {
@@ -42,9 +37,9 @@ internal sealed class BinWriter
     }
 
     public void WriteInt32(int v) => BinaryPrimitives.WriteInt32LittleEndian(Reserve(4), v);
-    public void WriteUInt32(uint v) => BinaryPrimitives.WriteUInt32LittleEndian(Reserve(4), v);
     public void WriteInt64(long v) => BinaryPrimitives.WriteInt64LittleEndian(Reserve(8), v);
     public void WriteDouble(double v) => BinaryPrimitives.WriteDoubleLittleEndian(Reserve(8), v);
+    public void WriteBytes(ReadOnlySpan<byte> data) => data.CopyTo(Reserve(data.Length));
 
     public void WriteVarUInt(ulong v)
     {
@@ -64,22 +59,10 @@ internal sealed class BinWriter
 
     public void WriteString(string s)
     {
-        int max = Encoding.UTF8.GetMaxByteCount(s.Length);
-        if (s.Length < 128 && max < 1024)
-        {
-            // fast path: encode directly after a 1-2 byte length prefix
-            Span<byte> tmp = stackalloc byte[max];
-            int n = Encoding.UTF8.GetBytes(s, tmp);
-            WriteVarUInt((ulong)n);
-            tmp[..n].CopyTo(Reserve(n));
-            return;
-        }
         int len = Encoding.UTF8.GetByteCount(s);
         WriteVarUInt((ulong)len);
         Encoding.UTF8.GetBytes(s, Reserve(len));
     }
-
-    public void WriteBytes(ReadOnlySpan<byte> data) => data.CopyTo(Reserve(data.Length));
 
     public void WriteValue(in Value v)
     {
@@ -109,114 +92,77 @@ internal sealed class BinWriter
                     }
                     break;
                 }
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+                WriteVarInt(v.Num);
+                break;
+            case ValueKind.Time:
+                WriteVarInt(v.Num);
+                WriteVarInt(v.Zone.FixedOffset);
+                break;
+            case ValueKind.LocalDateTime:
+                WriteInt64(v.Num);
+                break;
+            case ValueKind.DateTime:
+                WriteInt64(v.Num);
+                if (v.Zone.Name != null)
+                {
+                    WriteByte(1);
+                    WriteString(v.Zone.Name);
+                }
+                else
+                {
+                    WriteByte(0);
+                    WriteVarInt(v.Zone.FixedOffset);
+                }
+                break;
+            case ValueKind.Duration:
+                {
+                    var d = v.AsDuration();
+                    WriteVarInt(d.Months);
+                    WriteVarInt(d.Days);
+                    WriteVarInt(d.Seconds);
+                    WriteVarUInt((ulong)d.Nanoseconds);
+                    break;
+                }
+            case ValueKind.Point:
+                {
+                    var p = v.AsPoint();
+                    WriteVarInt(p.Srid);
+                    WriteDouble(p.X);
+                    WriteDouble(p.Y);
+                    WriteByte(p.Z.HasValue ? (byte)1 : (byte)0);
+                    if (p.Z.HasValue) WriteDouble(p.Z.Value);
+                    break;
+                }
             default:
-                throw new GraphDbException($"Cannot persist value of kind {v.Kind}");
+                throw new CypherRuntimeException($"Values of type {v.Kind} cannot be stored as properties");
         }
-    }
-
-    public void WriteProps(PropertyMap? props)
-    {
-        if (props is null) { WriteVarUInt(0); return; }
-        WriteVarUInt((ulong)props.Count);
-        var keys = props.Keys;
-        var vals = props.Values;
-        for (int i = 0; i < keys.Length; i++)
-        {
-            WriteVarUInt((ulong)keys[i]);
-            WriteValue(vals[i]);
-        }
-    }
-
-    public void WriteIntArray(int[]? arr)
-    {
-        if (arr is null) { WriteVarUInt(0); return; }
-        WriteVarUInt((ulong)arr.Length);
-        foreach (var x in arr) WriteVarUInt((ulong)x);
     }
 }
 
-/// <summary>Binary reader over a byte array, optionally refilled from a stream.</summary>
-internal sealed class BinReader
+/// <summary>Reader over a span (typically pointing into a memory-mapped page).</summary>
+internal ref struct SpanReader
 {
-    private readonly Stream? _stream;
-    private byte[] _buf;
-    private int _pos;
-    private int _len;
+    private readonly ReadOnlySpan<byte> _s;
+    public int Pos;
 
-    public BinReader(byte[] data, int length)
+    public SpanReader(ReadOnlySpan<byte> s, int pos = 0)
     {
-        _buf = data;
-        _len = length;
+        _s = s;
+        Pos = pos;
     }
 
-    public BinReader(Stream stream, int bufferSize = 1 << 20)
-    {
-        _stream = stream;
-        _buf = new byte[bufferSize];
-    }
-
-    public bool AtEnd
-    {
-        get
-        {
-            if (_pos < _len) return false;
-            if (_stream is null) return true;
-            return !TryFill(1);
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void Ensure(int n)
-    {
-        if (_len - _pos >= n) return;
-        if (!TryFill(n)) throw new EndOfStreamException();
-    }
-
-    private bool TryFill(int n)
-    {
-        if (_stream is null) return _len - _pos >= n;
-        int remaining = _len - _pos;
-        if (n > _buf.Length)
-        {
-            var nb = new byte[Math.Max(n, _buf.Length * 2)];
-            Array.Copy(_buf, _pos, nb, 0, remaining);
-            _buf = nb;
-        }
-        else if (remaining > 0) Array.Copy(_buf, _pos, _buf, 0, remaining);
-        _pos = 0;
-        _len = remaining;
-        while (_len < n)
-        {
-            int r = _stream.Read(_buf, _len, _buf.Length - _len);
-            if (r <= 0) return false;
-            _len += r;
-        }
-        return true;
-    }
-
-    public byte ReadByte()
-    {
-        Ensure(1);
-        return _buf[_pos++];
-    }
-
-    public int ReadInt32()
-    {
-        Ensure(4);
-        int v = BinaryPrimitives.ReadInt32LittleEndian(new ReadOnlySpan<byte>(_buf, _pos, 4));
-        _pos += 4;
-        return v;
-    }
-
-    public uint ReadUInt32() => (uint)ReadInt32();
+    public byte ReadByte() => _s[Pos++];
 
     public long ReadInt64()
     {
-        Ensure(8);
-        long v = BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(_buf, _pos, 8));
-        _pos += 8;
+        long v = BinaryPrimitives.ReadInt64LittleEndian(_s.Slice(Pos, 8));
+        Pos += 8;
         return v;
     }
+
+    public double ReadDouble() => BitConverter.Int64BitsToDouble(ReadInt64());
 
     public ulong ReadVarUInt()
     {
@@ -224,7 +170,7 @@ internal sealed class BinReader
         int shift = 0;
         while (true)
         {
-            byte b = ReadByte();
+            byte b = _s[Pos++];
             result |= (ulong)(b & 0x7f) << shift;
             if ((b & 0x80) == 0) return result;
             shift += 7;
@@ -243,9 +189,8 @@ internal sealed class BinReader
     public string ReadString()
     {
         int len = ReadVarInt32();
-        Ensure(len);
-        var s = Encoding.UTF8.GetString(_buf, _pos, len);
-        _pos += len;
+        var s = Encoding.UTF8.GetString(_s.Slice(Pos, len));
+        Pos += len;
         return s;
     }
 
@@ -262,7 +207,8 @@ internal sealed class BinReader
             case ValueKind.List:
                 {
                     int n = ReadVarInt32();
-                    var arr = n == 0 ? Array.Empty<Value>() : new Value[n];
+                    if (n == 0) return Value.EmptyList;
+                    var arr = new Value[n];
                     for (int i = 0; i < n; i++) arr[i] = ReadValue();
                     return Value.FromList(arr);
                 }
@@ -273,42 +219,46 @@ internal sealed class BinReader
                     for (int i = 0; i < n; i++) d[ReadString()] = ReadValue();
                     return Value.FromMap(d);
                 }
+            case ValueKind.Date:
+            case ValueKind.LocalTime:
+                return new Value(kind, ReadVarInt(), null);
+            case ValueKind.Time:
+                {
+                    long t = ReadVarInt();
+                    return Value.FromTimeTicks(t, ZoneInfo.FromOffset((int)ReadVarInt()));
+                }
+            case ValueKind.LocalDateTime: return new Value(kind, ReadInt64(), null);
+            case ValueKind.DateTime:
+                {
+                    long utc = ReadInt64();
+                    var zone = ReadByte() == 1 ? ZoneInfo.FromName(ReadString()) : ZoneInfo.FromOffset((int)ReadVarInt());
+                    return Value.FromZonedUtc(utc, zone);
+                }
+            case ValueKind.Duration:
+                {
+                    long m = ReadVarInt(), d = ReadVarInt(), s = ReadVarInt();
+                    return Value.FromDuration(new CypherDuration(m, d, s, (long)ReadVarUInt()));
+                }
+            case ValueKind.Point:
+                {
+                    int srid = (int)ReadVarInt();
+                    double x = ReadDouble(), y = ReadDouble();
+                    double? z = ReadByte() == 1 ? ReadDouble() : null;
+                    return Value.FromPoint(new CypherPoint(srid, x, y, z));
+                }
             default: throw new InvalidDataException($"Unknown value tag {kind}");
         }
     }
-
-    public PropertyMap? ReadProps()
-    {
-        int n = ReadVarInt32();
-        if (n == 0) return null;
-        var m = new PropertyMap(n);
-        for (int i = 0; i < n; i++)
-        {
-            int k = ReadVarInt32();
-            m.Set(k, ReadValue());
-        }
-        return m;
-    }
-
-    public int[]? ReadIntArray()
-    {
-        int n = ReadVarInt32();
-        if (n == 0) return null;
-        var arr = new int[n];
-        for (int i = 0; i < n; i++) arr[i] = ReadVarInt32();
-        return arr;
-    }
 }
 
-internal static class Crc
+internal static class CrcStream
 {
-    /// <summary>Hardware accelerated CRC32C.</summary>
-    public static uint Compute(ReadOnlySpan<byte> data)
+    /// <summary>Hardware accelerated CRC32C (state must start at 0xFFFFFFFF and be inverted at the end).</summary>
+    public static uint Update(uint state, ReadOnlySpan<byte> data)
     {
-        uint crc = 0xFFFFFFFFu;
         var longs = MemoryMarshal.Cast<byte, ulong>(data);
-        foreach (var l in longs) crc = BitOperations.Crc32C(crc, l);
-        for (int i = longs.Length * 8; i < data.Length; i++) crc = BitOperations.Crc32C(crc, data[i]);
-        return ~crc;
+        foreach (var l in longs) state = BitOperations.Crc32C(state, l);
+        for (int i = longs.Length * 8; i < data.Length; i++) state = BitOperations.Crc32C(state, data[i]);
+        return state;
     }
 }

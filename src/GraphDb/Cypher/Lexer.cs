@@ -14,7 +14,7 @@ internal enum TokKind : byte
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Dot, DotDot, Colon, Semicolon, Pipe,
     Plus, Minus, Star, Slash, Percent, Caret,
-    Eq, Neq, Lt, Gt, Le, Ge, RegexEq, PlusEq,
+    Eq, Neq, Lt, Gt, Le, Ge, RegexEq, PlusEq, Amp, Bang,
 }
 
 internal readonly struct Tok
@@ -149,6 +149,7 @@ internal static class Lexer
                 case '/': k = TokKind.Slash; break;
                 case '%': k = TokKind.Percent; break;
                 case '^': k = TokKind.Caret; break;
+                case '&': k = TokKind.Amp; break;
                 case '-': k = TokKind.Minus; break;
                 case '.':
                     if (i < s.Length && s[i] == '.') { i++; k = TokKind.DotDot; }
@@ -164,7 +165,7 @@ internal static class Lexer
                     break;
                 case '!':
                     if (i < s.Length && s[i] == '=') { i++; k = TokKind.Neq; }
-                    else throw new CypherSyntaxException("Unexpected character '!'", start);
+                    else k = TokKind.Bang;
                     break;
                 case '<':
                     if (i < s.Length && s[i] == '=') { i++; k = TokKind.Le; }

@@ -17,6 +17,20 @@ public enum ValueKind : byte
     Node,
     Relationship,
     Path,
+    /// <summary>Calendar date (Num = DateOnly.DayNumber).</summary>
+    Date,
+    /// <summary>Time of day without zone (Num = ticks of day).</summary>
+    LocalTime,
+    /// <summary>Time of day with offset (Num = local ticks of day, Obj = zone).</summary>
+    Time,
+    /// <summary>Date and time without zone (Num = DateTime ticks).</summary>
+    LocalDateTime,
+    /// <summary>Instant with zone (Num = UTC ticks, Obj = zone).</summary>
+    DateTime,
+    /// <summary>Duration (Obj = <see cref="CypherDuration"/>).</summary>
+    Duration,
+    /// <summary>Spatial point (Obj = <see cref="CypherPoint"/>).</summary>
+    Point,
 }
 
 /// <summary>
@@ -54,8 +68,18 @@ public readonly struct Value : IEquatable<Value>
     public static Value FromList(Value[] items) => new(ValueKind.List, 0, items);
     public static Value FromList(IEnumerable<Value> items) => new(ValueKind.List, 0, items.ToArray());
     public static Value FromMap(Dictionary<string, Value> map) => new(ValueKind.Map, 0, map);
-    internal static Value FromNodeId(int id) => new(ValueKind.Node, id, null);
-    internal static Value FromRelId(int id) => new(ValueKind.Relationship, id, null);
+    internal static Value FromNodeId(long id) => new(ValueKind.Node, id, null);
+    internal static Value FromRelId(long id) => new(ValueKind.Relationship, id, null);
+
+    public static Value FromDate(DateOnly d) => new(ValueKind.Date, d.DayNumber, null);
+    public static Value FromLocalTime(TimeOnly t) => new(ValueKind.LocalTime, t.Ticks, null);
+    public static Value FromTime(TimeOnly t, TimeSpan offset) => new(ValueKind.Time, t.Ticks, ZoneInfo.FromOffset((int)offset.TotalSeconds));
+    public static Value FromLocalDateTime(System.DateTime dt) => new(ValueKind.LocalDateTime, dt.Ticks, null);
+    public static Value FromDateTime(DateTimeOffset dto) => new(ValueKind.DateTime, dto.UtcTicks, ZoneInfo.FromOffset((int)dto.Offset.TotalSeconds));
+    public static Value FromDuration(CypherDuration d) => new(ValueKind.Duration, 0, d);
+    public static Value FromPoint(CypherPoint p) => new(ValueKind.Point, 0, p);
+    internal static Value FromZonedUtc(long utcTicks, ZoneInfo zone) => new(ValueKind.DateTime, utcTicks, zone);
+    internal static Value FromTimeTicks(long ticksOfDay, ZoneInfo zone) => new(ValueKind.Time, ticksOfDay, zone);
     internal static Value FromNode(Node n) => new(ValueKind.Node, n.Id, n);
     internal static Value FromRel(Relationship r) => new(ValueKind.Relationship, r.Id, r);
     internal static Value FromPath(GraphPath p) => new(ValueKind.Path, 0, p);
@@ -134,13 +158,59 @@ public readonly struct Value : IEquatable<Value>
         get => (string)Obj!;
     }
 
-    internal int EntityId
+    internal long EntityId
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => (int)Num;
+        get => Num;
     }
 
-    /// <summary>Converts to a plain CLR object (long, double, string, bool, List, Dictionary, Node...).</summary>
+    internal ZoneInfo Zone => (ZoneInfo)Obj!;
+
+    public bool IsTemporal => Kind is ValueKind.Date or ValueKind.LocalTime or ValueKind.Time or ValueKind.LocalDateTime or ValueKind.DateTime;
+
+    public DateOnly AsDate() => Kind switch
+    {
+        ValueKind.Date => DateOnly.FromDayNumber((int)Num),
+        ValueKind.LocalDateTime => DateOnly.FromDateTime(new System.DateTime(Num)),
+        ValueKind.DateTime => DateOnly.FromDateTime(AsDateTime().DateTime),
+        _ => throw TypeError("Date"),
+    };
+
+    public TimeOnly AsLocalTime() => Kind switch
+    {
+        ValueKind.LocalTime or ValueKind.Time => new TimeOnly(Num),
+        ValueKind.LocalDateTime => TimeOnly.FromDateTime(new System.DateTime(Num)),
+        ValueKind.DateTime => TimeOnly.FromDateTime(AsDateTime().DateTime),
+        _ => throw TypeError("LocalTime"),
+    };
+
+    public System.DateTime AsLocalDateTime() => Kind switch
+    {
+        ValueKind.LocalDateTime => new System.DateTime(Num, DateTimeKind.Unspecified),
+        ValueKind.DateTime => AsDateTime().DateTime,
+        ValueKind.Date => AsDate().ToDateTime(TimeOnly.MinValue),
+        _ => throw TypeError("LocalDateTime"),
+    };
+
+    public DateTimeOffset AsDateTime() => Kind switch
+    {
+        ValueKind.DateTime => Temporal.ToOffset(Num, Zone),
+        _ => throw TypeError("DateTime"),
+    };
+
+    /// <summary>Offset of a Time or DateTime value.</summary>
+    public TimeSpan AsOffset() => Kind switch
+    {
+        ValueKind.Time => TimeSpan.FromSeconds(Zone.OffsetAt(0)),
+        ValueKind.DateTime => TimeSpan.FromSeconds(Zone.OffsetAt(Num)),
+        _ => throw TypeError("Time"),
+    };
+
+    public CypherDuration AsDuration() => Kind == ValueKind.Duration ? (CypherDuration)Obj! : throw TypeError("Duration");
+
+    public CypherPoint AsPoint() => Kind == ValueKind.Point ? (CypherPoint)Obj! : throw TypeError("Point");
+
+    /// <summary>Converts to a plain CLR object (long, double, string, bool, List, Dictionary, Node, DateOnly...).</summary>
     public object? ToObject() => Kind switch
     {
         ValueKind.Null => null,
@@ -153,8 +223,20 @@ public readonly struct Value : IEquatable<Value>
         ValueKind.Node => Obj ?? (object)Num,
         ValueKind.Relationship => Obj ?? (object)Num,
         ValueKind.Path => Obj,
+        ValueKind.Date => AsDate(),
+        ValueKind.LocalTime => AsLocalTime(),
+        ValueKind.Time => new DateTimeOffset(new System.DateTime(1, 1, 1).AddTicks(Num), AsOffset()),
+        ValueKind.LocalDateTime => AsLocalDateTime(),
+        ValueKind.DateTime => AsDateTime(),
+        ValueKind.Duration or ValueKind.Point => Obj,
         _ => null,
     };
+
+    /// <summary>Serializes the value as JSON.</summary>
+    public string ToJson() => Json.Serialize(this);
+
+    /// <summary>Parses JSON text into a value (objects become maps, arrays lists).</summary>
+    public static Value FromJson(string json) => Json.Parse(json);
 
     /// <summary>Converts a CLR object into a Value (used for query parameters).</summary>
     public static Value FromObject(object? o)
@@ -212,8 +294,17 @@ public readonly struct Value : IEquatable<Value>
             case decimal m: return FromFloat((double)m);
             case char c: return FromString(c.ToString());
             case Guid g: return FromString(g.ToString());
-            case DateTime dt: return FromString(dt.ToString("O", CultureInfo.InvariantCulture));
-            case DateTimeOffset dto: return FromString(dto.ToString("O", CultureInfo.InvariantCulture));
+            case System.DateTime dt:
+                return dt.Kind == DateTimeKind.Utc ? FromZonedUtc(dt.Ticks, ZoneInfo.Utc) : FromLocalDateTime(dt);
+            case DateTimeOffset dto: return FromDateTime(dto);
+            case DateOnly dOnly: return FromDate(dOnly);
+            case TimeOnly tOnly: return FromLocalTime(tOnly);
+            case TimeSpan ts: return FromDuration(CypherDuration.FromTimeSpan(ts));
+            case CypherDuration cd: return FromDuration(cd);
+            case CypherPoint cp: return FromPoint(cp);
+            case System.Text.Json.JsonElement je: return Json.FromElement(je);
+            case System.Text.Json.JsonDocument jd: return Json.FromElement(jd.RootElement);
+            case System.Text.Json.Nodes.JsonNode jn: return Json.Parse(jn.ToJsonString());
             case Enum e: return FromString(e.ToString());
             case Node n: return FromNode(n);
             case Relationship r: return FromRel(r);
@@ -314,6 +405,18 @@ public readonly struct Value : IEquatable<Value>
                 break;
             case ValueKind.Path:
                 sb.Append(((GraphPath)Obj!).ToString());
+                break;
+            default:
+                if (quoteStrings && Kind != ValueKind.Point) sb.Append(Kind switch
+                {
+                    ValueKind.Date => "date('",
+                    ValueKind.LocalTime => "localtime('",
+                    ValueKind.Time => "time('",
+                    ValueKind.LocalDateTime => "localdatetime('",
+                    ValueKind.DateTime => "datetime('",
+                    _ => "duration('",
+                }).Append(Temporal.Format(this)).Append("')");
+                else sb.Append(Temporal.Format(this));
                 break;
         }
     }

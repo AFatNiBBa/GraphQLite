@@ -20,16 +20,18 @@ internal sealed class PlannedQuery
 /// </summary>
 internal sealed partial class Planner
 {
-    private readonly GraphStore _store;
+    private readonly StoreTx _store;
     private int _slots;
     private int _anon;
     private readonly Dictionary<string, int> _params = new(StringComparer.Ordinal);
     private bool _readsSinceBarrier;
     private bool _varExpandSinceBarrier;
     private bool _writesSinceBarrier;
+    /// <summary>An index range scan is active in the pipeline: writes could move B+tree entries under it.</summary>
+    private bool _indexSinceBarrier;
     private bool _isWrite;
 
-    private Planner(GraphStore store) => _store = store;
+    private Planner(StoreTx store) => _store = store;
 
     private int NewSlot() => _slots++;
     private string Anon() => "  anon" + (_anon++);
@@ -45,39 +47,33 @@ internal sealed partial class Planner
         return i;
     }
 
-    public static PlannedQuery Plan(GraphStore store, QueryStatement q)
+    public static PlannedQuery Plan(StoreTx store, QueryStatement q)
     {
         var p = new Planner(store);
         return p.PlanQuery(q);
     }
 
+    private (Operator Root, string[] Columns, int[] Slots) PlanBody(QueryStatement q, Dictionary<string, int>? initialScope)
+    {
+        if (q.Parts.Count == 1) return PlanSingle(q.Parts[0], null, null, initialScope);
+        int[]? unionSlots = null;
+        string[]? unionCols = null;
+        var branches = new List<Operator>();
+        foreach (var part in q.Parts)
+        {
+            var (op, cols, s) = PlanSingle(part, unionSlots, unionCols, initialScope);
+            unionSlots ??= s;
+            unionCols ??= cols;
+            branches.Add(op);
+        }
+        bool all = q.UnionAll.All(x => x);
+        if (q.UnionAll.Distinct().Count() > 1) throw new CypherSemanticException("Mixing UNION and UNION ALL is not supported");
+        return (new UnionOp(branches.ToArray(), unionSlots!, !all), unionCols!, unionSlots!);
+    }
+
     private PlannedQuery PlanQuery(QueryStatement q)
     {
-        Operator root;
-        string[] columns;
-        int[] slots;
-        if (q.Parts.Count == 1)
-        {
-            (root, columns, slots) = PlanSingle(q.Parts[0], null, null);
-        }
-        else
-        {
-            int[]? unionSlots = null;
-            string[]? unionCols = null;
-            var branches = new List<Operator>();
-            foreach (var part in q.Parts)
-            {
-                var (op, cols, s) = PlanSingle(part, unionSlots, unionCols);
-                unionSlots ??= s;
-                unionCols ??= cols;
-                branches.Add(op);
-            }
-            bool all = q.UnionAll.All(x => x);
-            if (q.UnionAll.Distinct().Count() > 1) throw new CypherSemanticException("Mixing UNION and UNION ALL is not supported");
-            root = new UnionOp(branches.ToArray(), unionSlots!, !all);
-            columns = unionCols!;
-            slots = unionSlots!;
-        }
+        var (root, columns, slots) = PlanBody(q, null);
         var names = new string[_params.Count];
         foreach (var kv in _params) names[kv.Value] = kv.Key;
         return new PlannedQuery
@@ -94,13 +90,14 @@ internal sealed partial class Planner
 
     // ================================================================== single query
 
-    private (Operator, string[], int[]) PlanSingle(List<Clause> clauses, int[]? unionSlots, string[]? unionCols)
+    private (Operator, string[], int[]) PlanSingle(List<Clause> clauses, int[]? unionSlots, string[]? unionCols, Dictionary<string, int>? initialScope)
     {
         Operator op = new StartOp();
-        var scope = new Dictionary<string, int>(StringComparer.Ordinal);
+        var scope = initialScope is null ? new Dictionary<string, int>(StringComparer.Ordinal) : new Dictionary<string, int>(initialScope, StringComparer.Ordinal);
         _readsSinceBarrier = false;
         _varExpandSinceBarrier = false;
         _writesSinceBarrier = false;
+        _indexSinceBarrier = false;
         for (int i = 0; i < clauses.Count; i++)
         {
             var clause = clauses[i];
@@ -129,7 +126,7 @@ internal sealed partial class Planner
                     op = PlanClause(op, scope, clause);
                     if (last)
                     {
-                        if (clause is MatchClause or WithClause or UnwindClause or CallClause)
+                        if (clause is MatchClause or WithClause or UnwindClause or CallClause or LoadCsvClause)
                             throw new CypherSemanticException($"Query cannot conclude with {ClauseName(clause)} (must be RETURN or an update clause)");
                         if (unionSlots != null) throw new CypherSemanticException("UNION sub queries must end with RETURN");
                         return (op, [], []);
@@ -157,6 +154,16 @@ internal sealed partial class Planner
                 // reads after writes must observe the complete effect of the previous clauses (Neo4j "Eager")
                 if (_writesSinceBarrier) op = Barrier(op);
                 return PlanMatch(op, scope, m);
+            case LoadCsvClause lc:
+                {
+                    var url = Compile(lc.Url, scope);
+                    int slot = NewSlot();
+                    scope[lc.Variable] = slot;
+                    char sep = lc.FieldTerminator is { Length: > 0 } ft ? (ft == "\\t" ? '\t' : ft[0]) : ',';
+                    return new LoadCsvOp(op, url, slot, lc.Headers, sep);
+                }
+            case SubqueryClause sq:
+                return PlanSubquery(op, scope, sq);
             case UnwindClause u:
                 {
                     var list = Compile(u.List, scope);
@@ -174,6 +181,9 @@ internal sealed partial class Planner
                 }
             case CreateClause c:
                 {
+                    // creating only relationships between bound nodes never touches node indexes
+                    bool onlyRels = c.Pattern.All(p => p.Nodes.All(n => n.Variable != null && scope.ContainsKey(n.Variable)));
+                    if (!onlyRels) op = BeforeWrite(op);
                     MarkWrite();
                     if (_varExpandSinceBarrier) op = Barrier(op);
                     var spec = BuildCreateSpec(c.Pattern, new HashSet<string>(scope.Keys), scope, false);
@@ -182,13 +192,16 @@ internal sealed partial class Planner
             case MergeClause mc:
                 return PlanMerge(op, scope, mc);
             case SetClause sc:
+                op = BeforeWrite(op);
                 MarkWrite();
                 return new SetOp(op, sc.Items.Select(it => CompileSetItem(it, scope)).ToArray(), false);
             case RemoveClause rc:
+                op = BeforeWrite(op);
                 MarkWrite();
                 return new SetOp(op, rc.Items.Select(it => CompileSetItem(it, scope)).ToArray(), true);
             case DeleteClause dc:
                 {
+                    op = BeforeWrite(op);
                     MarkWrite();
                     if (_readsSinceBarrier) op = Barrier(op);
                     return new DeleteOp(op, dc.Exprs.Select(e => Compile(e, scope)).ToArray(), dc.Detach);
@@ -239,11 +252,50 @@ internal sealed partial class Planner
         _writesSinceBarrier = true;
     }
 
+    /// <summary>Called before planning an updating clause.</summary>
+    private Operator BeforeWrite(Operator op) => _indexSinceBarrier ? Barrier(op) : op;
+
+    private Operator PlanSubquery(Operator op, Dictionary<string, int> scope, SubqueryClause sq)
+    {
+        Dictionary<string, int> inner;
+        if (sq.Imports is null || sq.ImportAll) inner = new Dictionary<string, int>(scope, StringComparer.Ordinal);
+        else
+        {
+            inner = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var v in sq.Imports)
+            {
+                if (!scope.TryGetValue(v, out var s)) throw new CypherSemanticException($"Variable `{v}` not defined");
+                inner[v] = s;
+            }
+        }
+        bool r = _readsSinceBarrier, ve = _varExpandSinceBarrier, w = _writesSinceBarrier;
+        bool wasWrite = _isWrite;
+        _isWrite = false;
+        var (innerOp, cols, slots) = PlanBody(sq.Query, inner);
+        bool innerWrites = _isWrite;
+        _isWrite |= wasWrite;
+        _readsSinceBarrier = r;
+        _varExpandSinceBarrier = ve;
+        _writesSinceBarrier = w || innerWrites;
+        if (sq.InTransactions && !innerWrites) { /* allowed, just batching */ }
+        for (int i = 0; i < cols.Length; i++)
+        {
+            if (scope.ContainsKey(cols[i]) && !(inner.TryGetValue(cols[i], out var s) && s == slots[i]))
+                throw new CypherSemanticException($"Variable `{cols[i]}` already declared in outer scope");
+            scope[cols[i]] = slots[i];
+        }
+        if (innerWrites && _readsSinceBarrier) op = Barrier(op);
+        var batch = sq.InTransactions ? (sq.BatchSize is null ? (Eval)(_ => Value.FromInt(1000)) : Compile(sq.BatchSize, new Dictionary<string, int>())) : null;
+        return new ApplyOp(op, innerOp, cols.Length == 0, batch);
+    }
+
     private Operator Barrier(Operator op)
     {
         _readsSinceBarrier = false;
         _varExpandSinceBarrier = false;
+        _indexSinceBarrier = false;
         _writesSinceBarrier = false;
+        _indexSinceBarrier = false;
         return new EagerOp(op);
     }
 
@@ -357,6 +409,7 @@ internal sealed partial class Planner
             _readsSinceBarrier = false;
             _varExpandSinceBarrier = false;
             _writesSinceBarrier = false;
+            _indexSinceBarrier = false;
 
             // grouping variables remain visible (first-row snapshot) for post-aggregation expressions
             var postVars = new Dictionary<string, int>(scope, StringComparer.Ordinal);
@@ -402,6 +455,7 @@ internal sealed partial class Planner
             _readsSinceBarrier = false;
             _varExpandSinceBarrier = false;
             _writesSinceBarrier = false;
+            _indexSinceBarrier = false;
         }
         if (skip != null) op = new SkipOp(op, skip);
         if (limit != null) op = new LimitOp(op, limit);
@@ -451,7 +505,10 @@ internal sealed partial class Planner
     {
         public required Dictionary<string, int> Scope;
         public required List<Pred> Preds;
+        /// <summary>Labels every node variable must have.</summary>
         public required Dictionary<string, List<string>> Labels;
+        /// <summary>Disjunctions (at least one of) per node variable.</summary>
+        public required Dictionary<string, List<string>> AnyLabels;
         public required List<int> ClauseRels;
     }
 
@@ -467,13 +524,25 @@ internal sealed partial class Planner
             foreach (var c in SplitAnd(where)) preds.Add(new Pred(c, FreeVars(c)));
 
         var labels = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var anyLabels = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         foreach (var part in parts)
         {
             foreach (var n in part.Nodes)
             {
-                if (!labels.TryGetValue(n.Variable!, out var l)) labels[n.Variable!] = l = new List<string>();
+                var v = n.Variable!;
+                if (!labels.TryGetValue(v, out var l)) labels[v] = l = new List<string>();
                 foreach (var x in n.Labels) if (!l.Contains(x)) l.Add(x);
-                AddInlineProps(preds, n.Variable!, n.Props);
+                var target = new VarExpr(v) { Text = v };
+                if (n.AnyLabels != null)
+                {
+                    anyLabels.TryAdd(v, n.AnyLabels);
+                    LabelExpression or = new LabelName(n.AnyLabels[0]);
+                    for (int i = 1; i < n.AnyLabels.Count; i++) or = new LabelOr(or, new LabelName(n.AnyLabels[i]));
+                    preds.Add(new Pred(new LabelCheckExpr(target, [], or) { Text = v + ":" + or }, [v]));
+                }
+                if (n.Residual != null)
+                    preds.Add(new Pred(new LabelCheckExpr(target, [], n.Residual) { Text = v + ":" + n.Residual }, [v]));
+                AddInlineProps(preds, v, n.Props);
             }
             foreach (var r in part.Rels)
                 if (!r.VarLength) AddInlineProps(preds, r.Variable!, r.Props);
@@ -485,8 +554,10 @@ internal sealed partial class Planner
             preds.Add(new Pred(new LabelCheckExpr(target, l.ToList()) { Text = v + ":" + string.Join(":", l) }, [v]));
             l.Clear();
         }
+        foreach (var v in anyLabels.Keys.ToList())
+            if (scope.ContainsKey(v)) anyLabels.Remove(v);
 
-        var st = new MatchState { Scope = scope, Preds = preds, Labels = labels, ClauseRels = new List<int>() };
+        var st = new MatchState { Scope = scope, Preds = preds, Labels = labels, AnyLabels = anyLabels, ClauseRels = new List<int>() };
         var remaining = new List<PatternPart>(parts);
         op = ApplyFilters(op, st);
         while (remaining.Count > 0)
@@ -557,63 +628,136 @@ internal sealed partial class Planner
         }, text);
     }
 
-    private enum LeafKind { AllNodes, Label, Index, IndexIn, Id }
+    private enum LeafKind { AllNodes, Label, LabelAny, Index, Id }
 
     private sealed class Leaf
     {
         public LeafKind Kind;
         public double Cost;
-        public Pred? Pred;
+        public SeekMode Mode;
         public Expr? Value;
+        public Expr? Low, High;
+        public bool LowInclusive, HighInclusive;
         public string? Label;
         public string? Key;
+        public string Desc = "";
     }
 
     private static bool BoundIn(HashSet<string> deps, Dictionary<string, int> scope) => deps.All(scope.ContainsKey);
+
+    private static BinOp Mirror(BinOp op) => op switch
+    {
+        BinOp.Lt => BinOp.Gt,
+        BinOp.Gt => BinOp.Lt,
+        BinOp.Le => BinOp.Ge,
+        BinOp.Ge => BinOp.Le,
+        _ => op,
+    };
+
+    /// <summary>Normalizes "v.key OP expr" / "expr OP v.key" where expr only depends on bound variables.</summary>
+    private static (string Key, BinOp Op, Expr Other)? PropertyPredicate(Expr e, string v, Dictionary<string, int> scope)
+    {
+        if (e is not BinaryExpr be) return null;
+        if (be.Op is not (BinOp.Eq or BinOp.In or BinOp.Lt or BinOp.Gt or BinOp.Le or BinOp.Ge or BinOp.StartsWith)) return null;
+        if (be.Left is PropertyExpr { Target: VarExpr lv } lp && lv.Name == v)
+        {
+            var deps = FreeVars(be.Right);
+            if (!deps.Contains(v) && BoundIn(deps, scope)) return (lp.Key, be.Op, be.Right);
+        }
+        if (be.Op is BinOp.In or BinOp.StartsWith) return null;
+        if (be.Right is PropertyExpr { Target: VarExpr rv } rp && rv.Name == v)
+        {
+            var deps = FreeVars(be.Left);
+            if (!deps.Contains(v) && BoundIn(deps, scope)) return (rp.Key, Mirror(be.Op), be.Left);
+        }
+        return null;
+    }
 
     private Leaf ChooseLeaf(NodePattern node, MatchState st)
     {
         var v = node.Variable!;
         var labels = st.Labels.TryGetValue(v, out var l) ? l : [];
         var best = new Leaf { Kind = LeafKind.AllNodes, Cost = _store.NodeCount * 1.2 + 10 };
+        long LabelCount(string name)
+        {
+            int id = _store.Labels.Lookup(name);
+            return id < 0 ? 0 : _store.LabelCount(id);
+        }
         foreach (var lbl in labels)
         {
-            int id = _store.Labels.Lookup(lbl);
-            double c = id < 0 ? 0 : _store.LabelCount(id);
+            double c = LabelCount(lbl);
             if (c < best.Cost) best = new Leaf { Kind = LeafKind.Label, Cost = c };
         }
+        if (labels.Count == 0 && st.AnyLabels.TryGetValue(v, out var any))
+        {
+            double c = any.Sum(a => (double)LabelCount(a)) + 1;
+            if (c < best.Cost) best = new Leaf { Kind = LeafKind.LabelAny, Cost = c };
+        }
+        var catalog = _store.Catalog;
         foreach (var p in st.Preds)
         {
-            if (p.Used || p.Expr is not BinaryExpr { Op: BinOp.Eq or BinOp.In } be) continue;
-            foreach (var (self, other, swapped) in new[] { (be.Left, be.Right, false), (be.Right, be.Left, true) })
+            if (p.Used) continue;
+            // id(n) = x / id(n) IN list
+            if (p.Expr is BinaryExpr { Op: BinOp.Eq or BinOp.In } ide)
             {
-                if (be.Op == BinOp.In && swapped) continue;
-                var otherDeps = FreeVars(other);
-                if (otherDeps.Contains(v) || !BoundIn(otherDeps, st.Scope)) continue;
-                if (self is FuncExpr { Name: "id", Args: [VarExpr iv] } && iv.Name == v)
+                foreach (var (self, other, swapped) in new[] { (ide.Left, ide.Right, false), (ide.Right, ide.Left, true) })
                 {
-                    double c = be.Op == BinOp.In ? (other is ListExpr le ? le.Items.Count : 10) : 1;
-                    if (c < best.Cost) best = new Leaf { Kind = LeafKind.Id, Cost = c, Pred = p, Value = other };
-                    continue;
+                    if (ide.Op == BinOp.In && swapped) continue;
+                    if (self is not FuncExpr { Name: "id", Args: [VarExpr iv] } || iv.Name != v) continue;
+                    var od = FreeVars(other);
+                    if (od.Contains(v) || !BoundIn(od, st.Scope)) continue;
+                    double c = ide.Op == BinOp.In ? (other is ListExpr le ? le.Items.Count : 10) : 1;
+                    if (c < best.Cost) best = new Leaf { Kind = LeafKind.Id, Cost = c, Value = other };
                 }
-                if (self is PropertyExpr { Target: VarExpr pv } pe && pv.Name == v)
+            }
+            if (PropertyPredicate(p.Expr, v, st.Scope) is not { } pp) continue;
+            int key = _store.PropKeys.Lookup(pp.Key);
+            if (key < 0) continue;
+            foreach (var lbl in labels)
+            {
+                int lid = _store.Labels.Lookup(lbl);
+                if (lid < 0 || catalog.Find(lid, key) is not { } ix) continue;
+                double n = LabelCount(lbl);
+                Leaf cand;
+                switch (pp.Op)
                 {
-                    int key = _store.PropKeys.Lookup(pe.Key);
-                    if (key < 0) continue;
-                    foreach (var lbl in labels)
-                    {
-                        int lid = _store.Labels.Lookup(lbl);
-                        if (lid < 0) continue;
-                        var ix = _store.FindIndex(lid, key);
-                        if (ix is null) continue;
-                        double c;
-                        if (be.Op == BinOp.In) c = 2 * (other is ListExpr le ? le.Items.Count : 10);
-                        else if (ix.Unique) c = 0.5;
-                        else if (other is LiteralExpr lit) c = 0.5 + ix.EstimateCount(lit.Value);
-                        else c = 1 + Math.Min(50, _store.LabelCount(lid) / 100.0);
-                        if (c < best.Cost)
-                            best = new Leaf { Kind = be.Op == BinOp.In ? LeafKind.IndexIn : LeafKind.Index, Cost = c, Pred = p, Value = other, Label = lbl, Key = pe.Key };
-                    }
+                    case BinOp.Eq:
+                        cand = new Leaf { Mode = SeekMode.Equal, Cost = ix.Unique ? 0.5 : 1 + n / 1000.0, Value = pp.Other, Desc = "= " + pp.Other.Text };
+                        break;
+                    case BinOp.In:
+                        cand = new Leaf { Mode = SeekMode.In, Cost = (pp.Other is ListExpr le ? le.Items.Count : 10) * (ix.Unique ? 0.5 : 1 + n / 1000.0), Value = pp.Other, Desc = "IN " + pp.Other.Text };
+                        break;
+                    case BinOp.StartsWith:
+                        cand = new Leaf { Mode = SeekMode.Prefix, Cost = 2 + n * 0.05, Value = pp.Other, Desc = "STARTS WITH " + pp.Other.Text };
+                        break;
+                    default:
+                        {
+                            // range: combine with a matching bound on the other side if present
+                            cand = new Leaf { Mode = SeekMode.Range, Cost = 2 + n * 0.3 };
+                            void Bound(BinOp op, Expr other)
+                            {
+                                if (op is BinOp.Gt or BinOp.Ge) { cand.Low ??= other; if (cand.Low == other) cand.LowInclusive = op == BinOp.Ge; }
+                                else { cand.High ??= other; if (cand.High == other) cand.HighInclusive = op == BinOp.Le; }
+                            }
+                            Bound(pp.Op, pp.Other);
+                            foreach (var q in st.Preds)
+                            {
+                                if (q == p || q.Used || PropertyPredicate(q.Expr, v, st.Scope) is not { } qq || qq.Key != pp.Key) continue;
+                                if (qq.Op is BinOp.Lt or BinOp.Le or BinOp.Gt or BinOp.Ge) Bound(qq.Op, qq.Other);
+                            }
+                            if (cand.Low != null && cand.High != null) cand.Cost = 2 + n * 0.1;
+                            cand.Desc = (cand.Low != null ? (cand.LowInclusive ? ">= " : "> ") + cand.Low.Text : "") +
+                                        (cand.Low != null && cand.High != null ? " AND " : "") +
+                                        (cand.High != null ? (cand.HighInclusive ? "<= " : "< ") + cand.High.Text : "");
+                            break;
+                        }
+                }
+                if (cand.Cost < best.Cost)
+                {
+                    cand.Kind = LeafKind.Index;
+                    cand.Label = lbl;
+                    cand.Key = pp.Key;
+                    best = cand;
                 }
             }
         }
@@ -628,19 +772,23 @@ internal sealed partial class Planner
         var labelNames = st.Labels.TryGetValue(v, out var l) ? l : [];
         var labels = labelNames.Select(x => new TokenRef(x, TokenKind.Label)).ToArray();
         _readsSinceBarrier = true;
-        if (leaf.Pred != null) leaf.Pred.Used = true;
         switch (leaf.Kind)
         {
             case LeafKind.AllNodes:
                 op = new AllNodesScanOp(op, slot, v);
                 break;
             case LeafKind.Label:
-                op = new LabelScanOp(op, slot, v, labels);
+                op = new LabelScanOp(op, slot, v, labels, []);
+                break;
+            case LeafKind.LabelAny:
+                op = new LabelScanOp(op, slot, v, [], st.AnyLabels[v].Select(x => new TokenRef(x, TokenKind.Label)).ToArray());
                 break;
             case LeafKind.Index:
-            case LeafKind.IndexIn:
-                op = new NodeIndexSeekOp(op, slot, v, labels, new TokenRef(leaf.Label!, TokenKind.Label),
-                    new TokenRef(leaf.Key!, TokenKind.PropKey), Compile(leaf.Value!, st.Scope), leaf.Kind == LeafKind.IndexIn);
+                _indexSinceBarrier = true;
+                op = new NodeIndexSeekOp(op, slot, v, labels, new TokenRef(leaf.Label!, TokenKind.Label), new TokenRef(leaf.Key!, TokenKind.PropKey),
+                    leaf.Mode, leaf.Value is null ? null : Compile(leaf.Value, st.Scope),
+                    leaf.Low is null ? null : Compile(leaf.Low, st.Scope), leaf.LowInclusive,
+                    leaf.High is null ? null : Compile(leaf.High, st.Scope), leaf.HighInclusive, leaf.Desc);
                 break;
             case LeafKind.Id:
                 op = new NodeByIdSeekOp(op, slot, v, Compile(leaf.Value!, st.Scope));
@@ -830,7 +978,7 @@ internal sealed partial class Planner
                 {
                     var v = vals[i](ctx);
                     if (v.IsNull) continue;
-                    GraphStore.ValidatePropertyValue(v);
+                    StoreTx.ValidatePropertyValue(v);
                     (pm ??= new PropertyMap(keys.Length)).Set(keys[i].GetOrCreate(ctx.Store), v);
                 }
                 return pm;
@@ -842,6 +990,7 @@ internal sealed partial class Planner
 
     private Operator PlanMerge(Operator op, Dictionary<string, int> scope, MergeClause mc)
     {
+        op = BeforeWrite(op);
         MarkWrite();
         if (_varExpandSinceBarrier) op = Barrier(op);
         var part = mc.Part;

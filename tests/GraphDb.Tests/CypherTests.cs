@@ -292,9 +292,9 @@ public class CypherTests : IDisposable
         Assert.Single(Q("MATCH (u:User {uid: 4242}) RETURN u"));
         Q("MATCH (u:User {uid: 4242}) REMOVE u:User");
         Assert.Empty(Q("MATCH (u:User {uid: 4242}) RETURN u"));
-        var ix = Q("CALL db.indexes() YIELD name, entries RETURN name, entries");
+        var ix = Q("CALL db.indexes() YIELD name, label, property RETURN name, label, property");
         Assert.Equal("user_uid", ix[0].Get<string>("name"));
-        Assert.Equal(499L, ix[0].Get<long>("entries"));
+        Assert.Equal("User", ix[0].Get<string>("label"));
         Q("DROP INDEX user_uid");
         Assert.DoesNotContain("NodeIndexSeek", Q("EXPLAIN MATCH (u:User {uid: 42}) RETURN u").Scalar<string>()!);
     }

@@ -98,7 +98,7 @@ public sealed class Record : IReadOnlyDictionary<string, Value>
 public sealed class QueryResult : IReadOnlyList<Record>
 {
     private readonly List<Record> _rows;
-    private readonly Dictionary<string, int> _colIndex;
+    private Dictionary<string, int>? _colIndex;
 
     public IReadOnlyList<string> Columns { get; }
     public QueryStatistics Statistics { get; }
@@ -107,13 +107,27 @@ public sealed class QueryResult : IReadOnlyList<Record>
     {
         Columns = columns;
         Statistics = stats;
-        _colIndex = new Dictionary<string, int>(columns.Length, StringComparer.Ordinal);
-        for (int i = 0; i < columns.Length; i++) _colIndex.TryAdd(columns[i], i);
         _rows = new List<Record>(rows.Count);
         foreach (var r in rows) _rows.Add(new Record(this, r));
     }
 
-    internal int IndexOf(string column) => _colIndex.TryGetValue(column, out var i) ? i : -1;
+    internal int IndexOf(string column)
+    {
+        var cols = Columns;
+        if (cols.Count <= 8)
+        {
+            for (int i = 0; i < cols.Count; i++)
+                if (string.Equals(cols[i], column, StringComparison.Ordinal)) return i;
+            return -1;
+        }
+        if (_colIndex is null)
+        {
+            var d = new Dictionary<string, int>(cols.Count, StringComparer.Ordinal);
+            for (int i = 0; i < cols.Count; i++) d.TryAdd(cols[i], i);
+            _colIndex = d;
+        }
+        return _colIndex.TryGetValue(column, out var ix) ? ix : -1;
+    }
 
     public int Count => _rows.Count;
     public Record this[int index] => _rows[index];
@@ -154,10 +168,10 @@ public sealed class QueryResult : IReadOnlyList<Record>
 
     // ------------------------------------------------------------------ materialization
 
-    internal sealed class Materializer(GraphStore store)
+    internal sealed class Materializer(StoreTx store)
     {
-        private readonly Dictionary<int, Node> _nodes = new();
-        private readonly Dictionary<int, Relationship> _rels = new();
+        private Dictionary<long, Node>? _nodes;
+        private Dictionary<long, Relationship>? _rels;
 
         public Value Convert(in Value v)
         {
@@ -201,14 +215,16 @@ public sealed class QueryResult : IReadOnlyList<Record>
             v.Kind is ValueKind.Node or ValueKind.Relationship or ValueKind.Path || v.Kind == ValueKind.List && v.ListItems.Any(NeedsWork) ||
             v.Kind == ValueKind.Map && v.MapItems.Values.Any(NeedsWork);
 
-        private Node GetNode(int id)
+        private Node GetNode(long id)
         {
+            _nodes ??= new Dictionary<long, Node>();
             if (!_nodes.TryGetValue(id, out var n)) _nodes[id] = n = store.MaterializeNode(id);
             return n;
         }
 
-        private Relationship GetRel(int id)
+        private Relationship GetRel(long id)
         {
+            _rels ??= new Dictionary<long, Relationship>();
             if (!_rels.TryGetValue(id, out var r)) _rels[id] = r = store.MaterializeRel(id);
             return r;
         }

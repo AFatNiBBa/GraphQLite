@@ -6,24 +6,25 @@ using GraphDb.Storage;
 namespace GraphDb;
 
 /// <summary>
-/// A database transaction. Read-only transactions share the database with other readers;
-/// a write transaction has exclusive access until it is committed, rolled back or disposed.
+/// A database transaction. Read-only transactions see an immutable snapshot taken when they start;
+/// a write transaction sees its own changes and is invisible to others until it commits.
 /// A failing statement is rolled back on its own: the transaction stays usable.
 /// Instances are not thread-safe; use one transaction per thread.
 /// </summary>
 public sealed class Transaction : IDisposable
 {
     private readonly GraphDatabase _db;
-    private readonly TxLog? _log;
+    internal readonly StoreTx Store;
+    private readonly bool _autoCommit;
     private bool _finished;
 
-    public bool IsReadOnly { get; }
+    public bool IsReadOnly => !Store.IsWriter;
 
-    internal Transaction(GraphDatabase db, bool readOnly)
+    internal Transaction(GraphDatabase db, StoreTx store, bool autoCommit)
     {
         _db = db;
-        IsReadOnly = readOnly;
-        _log = readOnly ? null : db.NewLog();
+        Store = store;
+        _autoCommit = autoCommit;
     }
 
     public QueryResult Execute(string query, IReadOnlyDictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
@@ -32,28 +33,27 @@ public sealed class Transaction : IDisposable
         var cached = _db.GetStatement(query);
         if (cached.IsWrite && IsReadOnly)
             throw new GraphDbException("Cannot execute an updating query in a read-only transaction");
-
-        int undoMark = _log?.Undo.Count ?? 0;
-        int redoMark = _log?.Redo?.Length ?? 0;
+        Store.BeginStatement();
         try
         {
-            return cached.Ast switch
+            var result = cached.Ast switch
             {
                 CreateIndexStatement ci => CreateIndex(ci),
                 DropIndexStatement di => DropIndex(di),
-                _ => Run(_db.GetPlan(cached), parameters, cancellationToken),
+                _ => Run(_db.GetPlan(cached, Store), parameters, cancellationToken),
             };
+            Store.EndStatement();
+            return result;
         }
         catch
         {
-            if (_log != null) _db.Store.RollbackTo(_log, undoMark, redoMark);
+            Store.RollbackStatement();
             throw;
         }
     }
 
     private QueryResult Run(PlannedQuery plan, IReadOnlyDictionary<string, object?>? parameters, CancellationToken ct)
     {
-        var store = _db.Store;
         if (plan.Explain)
         {
             var sb = new StringBuilder();
@@ -68,11 +68,12 @@ public sealed class Transaction : IDisposable
                 throw new CypherSemanticException($"Expected parameter: ${name}");
             pvals[i] = Value.FromObject(o);
         }
-        var ctx = new ExecContext(store, plan.SlotCount, pvals, _log, ct);
+        var ctx = new ExecContext(Store, plan.SlotCount, pvals, _db.Options, ct);
+        if (_autoCommit && Store.IsWriter) ctx.CommitBatch = CommitBatch;
         var cursor = plan.Root.Open(ctx);
         var rows = new List<Value[]>();
         var slots = plan.ColumnSlots;
-        var mat = new QueryResult.Materializer(store);
+        var mat = new QueryResult.Materializer(Store);
         var row = ctx.Row;
         while (cursor.Next())
         {
@@ -81,39 +82,38 @@ public sealed class Transaction : IDisposable
             for (int i = 0; i < slots.Length; i++) r[i] = mat.Convert(row[slots[i]]);
             rows.Add(r);
         }
-        if (ctx.PendingNodeDeletes != null)
-        {
-            foreach (var id in ctx.PendingNodeDeletes)
-            {
-                ref var n = ref store.Nodes[id];
-                if (n.Out.Count > 0 || n.In.Count > 0)
-                    throw new ConstraintViolationException(
-                        $"Cannot delete node<{id}>, because it still has relationships. To delete this node, you must first delete its relationships (or use DETACH DELETE).");
-            }
-        }
+        ctx.CheckPendingDeletes();
         return new QueryResult(plan.Columns, rows, ctx.Stats.ToStats());
+    }
+
+    /// <summary>CALL { } IN TRANSACTIONS: commits the work so far and keeps going.</summary>
+    private void CommitBatch()
+    {
+        Store.Commit();
+        _db.AfterCommit();
+        Store.BeginStatement();
     }
 
     private QueryResult CreateIndex(CreateIndexStatement ci)
     {
-        var store = _db.Store;
-        int label = store.Labels.GetOrCreate(ci.Label);
-        int key = store.PropKeys.GetOrCreate(ci.Property);
-        var existing = store.FindIndex(label, key);
+        int label = Store.Labels.GetOrCreate(ci.Label);
+        int key = Store.PropKeys.GetOrCreate(ci.Property);
+        var catalog = Store.Catalog;
+        var existing = catalog.Find(label, key);
         string name = ci.Name ?? (ci.Unique ? $"constraint_{ci.Label}_{ci.Property}" : $"index_{ci.Label}_{ci.Property}");
-        if (existing != null || store.IndexesByName.ContainsKey(name))
+        if (existing != null || catalog.ByName(name) != null)
         {
             if (ci.IfNotExists) return new QueryResult([], [], QueryStatistics.Empty);
             if (existing != null && existing.Unique != ci.Unique)
                 throw new GraphDbException($"An index already exists on :{ci.Label}({ci.Property}); drop it first");
         }
-        store.CreateIndex(name, label, key, ci.Unique, _log!);
+        Store.CreateIndex(name, label, key, ci.Unique);
         return new QueryResult([], [], QueryStatistics.Empty with { IndexesAdded = 1 });
     }
 
     private QueryResult DropIndex(DropIndexStatement di)
     {
-        if (!_db.Store.DropIndex(di.Name, _log!))
+        if (!Store.DropIndex(di.Name))
         {
             if (di.IfExists) return new QueryResult([], [], QueryStatistics.Empty);
             throw new GraphDbException($"No index or constraint named '{di.Name}'");
@@ -132,13 +132,17 @@ public sealed class Transaction : IDisposable
         }
         try
         {
-            _db.CommitWrite(_log!);
+            Store.Commit();
+            _db.AfterCommit();
+        }
+        catch
+        {
+            Store.Abort();
+            throw;
         }
         finally
         {
-            _db.Lock.ExitWrite();
-            try { _db.AfterWriteReleased(); }
-            finally { _db.WriterGate.Release(); }
+            _db.WriterGate.Release();
         }
     }
 
@@ -153,11 +157,10 @@ public sealed class Transaction : IDisposable
         }
         try
         {
-            _db.Store.Rollback(_log!);
+            Store.Abort();
         }
         finally
         {
-            _db.Lock.ExitWrite();
             _db.WriterGate.Release();
         }
     }

@@ -21,20 +21,20 @@ internal sealed class TokenRef
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int Resolve(GraphStore store)
+    public int Resolve(StoreTx store)
     {
         int id = _id;
         if (id >= 0) return id;
-        id = store.TokensOf(_kind).Lookup(Name);
+        id = store.G.TokensOf(_kind).Lookup(Name);
         if (id >= 0) _id = id;
         return id;
     }
 
-    public int GetOrCreate(GraphStore store)
+    public int GetOrCreate(StoreTx store)
     {
         int id = _id;
         if (id >= 0) return id;
-        id = store.TokensOf(_kind).GetOrCreate(Name);
+        id = store.G.TokensOf(_kind).GetOrCreate(Name);
         _id = id;
         return id;
     }
@@ -47,32 +47,47 @@ internal sealed class StatsCounter
 {
     public int NodesCreated, NodesDeleted, RelationshipsCreated, RelationshipsDeleted, PropertiesSet, LabelsAdded, LabelsRemoved, IndexesAdded, IndexesRemoved;
 
-    public QueryStatistics ToStats() => new(NodesCreated, NodesDeleted, RelationshipsCreated, RelationshipsDeleted, PropertiesSet,
+    public QueryStatistics ToStats() => (NodesCreated | NodesDeleted | RelationshipsCreated | RelationshipsDeleted | PropertiesSet | LabelsAdded | LabelsRemoved | IndexesAdded | IndexesRemoved) == 0
+        ? QueryStatistics.Empty
+        : new(NodesCreated, NodesDeleted, RelationshipsCreated, RelationshipsDeleted, PropertiesSet,
         LabelsAdded, LabelsRemoved, IndexesAdded, IndexesRemoved);
 }
 
 internal sealed class ExecContext
 {
-    public readonly GraphStore Store;
+    public readonly StoreTx Store;
     public readonly Value[] Row;
     public readonly Value[] Params;
-    /// <summary>Null for read-only execution.</summary>
-    public readonly TxLog? Log;
     public readonly StatsCounter Stats = new();
-    public HashSet<int>? PendingNodeDeletes;
+    public HashSet<long>? PendingNodeDeletes;
     public readonly CancellationToken Cancellation;
+    public readonly DatabaseOptions Options;
+    /// <summary>Commits the work done so far and continues (CALL ... IN TRANSACTIONS); null inside explicit transactions.</summary>
+    public Action? CommitBatch;
     private int _tick;
 
-    public ExecContext(GraphStore store, int slots, Value[] parameters, TxLog? log, CancellationToken ct)
+    public ExecContext(StoreTx store, int slots, Value[] parameters, DatabaseOptions options, CancellationToken ct)
     {
         Store = store;
         Row = new Value[slots];
         Params = parameters;
-        Log = log;
+        Options = options;
         Cancellation = ct;
     }
 
-    public TxLog WriteLog => Log ?? throw new GraphDbException("Cannot perform updates in a read-only transaction");
+    /// <summary>Verifies that deleted nodes have no remaining relationships (deferred DELETE check).</summary>
+    public void CheckPendingDeletes()
+    {
+        if (PendingNodeDeletes is null) return;
+        foreach (var id in PendingNodeDeletes)
+        {
+            var (o, i) = Store.Degree(id);
+            if (o > 0 || i > 0)
+                throw new ConstraintViolationException(
+                    $"Cannot delete node<{id}>, because it still has relationships. To delete this node, you must first delete its relationships (or use DETACH DELETE).");
+        }
+        PendingNodeDeletes = null;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void CheckCancel()

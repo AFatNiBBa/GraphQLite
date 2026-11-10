@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using GraphDb;
 
 // Usage: GraphDb.Bench [nodes] [relsPerNode] [file]
@@ -8,7 +8,7 @@ string? file = args.Length > 2 ? args[2] : null;
 
 if (file != null)
 {
-    foreach (var f in new[] { file, file + "-wal" }) if (File.Exists(f)) File.Delete(f);
+    if (Directory.Exists(file)) Directory.Delete(file, true);
 }
 
 using var db = file is null ? GraphDatabase.OpenInMemory() : GraphDatabase.Open(file, new DatabaseOptions { Sync = SyncMode.Normal });
@@ -145,7 +145,7 @@ if (file != null)
 {
     sw.Restart();
     db.Checkpoint();
-    Report("checkpoint (full snapshot)", 1, sw.Elapsed);
-    Console.WriteLine($"snapshot size: {new FileInfo(file).Length / 1024.0 / 1024.0:N1} MB");
+    Report("checkpoint", 1, sw.Elapsed);
+    Console.WriteLine($"database size: {new DirectoryInfo(file).GetFiles().Sum(x => x.Length) / 1024.0 / 1024.0:N1} MB");
 }
 Console.WriteLine($"(checksum {sum + sp + filt + relScan + agg.Count + top.Count})");

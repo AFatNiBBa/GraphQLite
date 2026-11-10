@@ -85,6 +85,7 @@ internal sealed partial class Planner
             case LabelCheckExpr lc:
                 {
                     var t = Compile(lc.Target, s);
+                    if (lc.Expression is { } lexpr) return ctx => ExprOps.LabelExpr(ctx, t(ctx), lexpr);
                     var labels = lc.Labels.Select(l => new TokenRef(l, TokenKind.Label)).ToArray();
                     return ctx => ExprOps.HasLabels(ctx, t(ctx), labels);
                 }
@@ -384,8 +385,8 @@ internal sealed partial class Planner
                             Dictionary<string, Value> all = target.Kind switch
                             {
                                 ValueKind.Map => target.MapItems,
-                                ValueKind.Node => ctx.Store.PropsToMap(ctx.Store.Nodes[target.EntityId].Props),
-                                ValueKind.Relationship => ctx.Store.PropsToMap(ctx.Store.Rels[target.EntityId].Props),
+                                ValueKind.Node => ctx.Store.PropsDict(ctx.Store.NodePropsAddr(target.EntityId)),
+                                ValueKind.Relationship => ctx.Store.PropsDict(ctx.Store.RelPropsAddr(target.EntityId)),
                                 _ => throw new CypherRuntimeException($"Map projection requires a node, relationship or map, got {target.Kind}"),
                             };
                             foreach (var kv in all) d[kv.Key] = kv.Value;
