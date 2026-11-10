@@ -115,11 +115,13 @@ Un database è una **directory**:
 
 `GraphDb.Server` espone una directory del database con il protocollo **Bolt**, lo stesso di Neo4j: i driver ufficiali
 (.NET, Java, Python, JavaScript, Go…) e gli strumenti che li usano si collegano con `bolt://` o `neo4j://` senza
-modifiche, quindi si può passare da Neo4j a GraphDb (e viceversa) cambiando solo l'indirizzo.
+modifiche, quindi si può passare da Neo4j a GraphDb (e viceversa) cambiando solo l'indirizzo. Anche **Neo4j Browser**
+si collega (vedi sotto).
 
 ```
 dotnet run -c Release --project src/GraphDb.Server -- mydb
 dotnet run -c Release --project src/GraphDb.Server -- mydb --host 0.0.0.0 --port 7687 --user neo4j --password secret
+dotnet run -c Release --project src/GraphDb.Server -- mydb --tls-self-signed
 ```
 
 | Opzione | Significato |
@@ -130,26 +132,51 @@ dotnet run -c Release --project src/GraphDb.Server -- mydb --host 0.0.0.0 --port
 | `--database` | nome del database esposto (default `neo4j`) |
 | `--advertised` | indirizzo restituito nelle tabelle di routing di `neo4j://` |
 | `--sync` | `off` / `normal` / `full` (vedi `SyncMode`) |
+| `--tls-cert` / `--tls-key` / `--tls-password` | abilita TLS con un certificato `.pfx`/`.p12` oppure PEM (certificato + chiave) |
+| `--tls-self-signed` | abilita TLS con un certificato self-signed, creato al primo avvio e salvato come `tls-selfsigned.pfx` nella directory del database |
+| `--tls-required` | rifiuta le connessioni non cifrate (altrimenti la stessa porta accetta entrambe) |
 
 Il server si può anche incorporare in un'applicazione: `new BoltServer(db, new BoltServerOptions { ... }).Start()`.
 
 Cosa supporta:
-- Bolt **4.4** e **5.0–5.4**: autenticazione (`HELLO` / `LOGON` / `LOGOFF`), query in auto-commit, transazioni esplicite
-  (`BEGIN` / `COMMIT` / `ROLLBACK`, anche le transazioni gestite `ExecuteRead` / `ExecuteWrite` dei driver), streaming
-  a blocchi (`PULL` con fetch size), `RESET`, access mode di lettura (le scritture vengono rifiutate);
+- Bolt **4.4** e **5.0–5.4** su TCP, **TLS** (`bolt+s://`, `neo4j+s://`, e `+ssc` per i certificati self-signed) e
+  **WebSocket** (`ws://` / `wss://`, usati da Neo4j Browser), tutti sulla stessa porta come in Neo4j. Una richiesta
+  HTTP normale riceve il documento di discovery di Neo4j (`bolt_direct`, `bolt_routing`, versione);
+- autenticazione (`HELLO` / `LOGON` / `LOGOFF`), query in auto-commit, transazioni esplicite (`BEGIN` / `COMMIT` /
+  `ROLLBACK`, anche le transazioni gestite `ExecuteRead` / `ExecuteWrite` dei driver), `RESET`, access mode di lettura
+  (le scritture vengono rifiutate);
+- **streaming**: le righe vengono prodotte mentre il client le chiede (`PULL` con fetch size) e inviate a blocchi di
+  64 KB, quindi una query che restituisce milioni di righe usa memoria costante sul server;
+- **scritture concorrenti**: le transazioni esplicite di scrittura sono transazioni concorrenti (vedi sopra), quindi i
+  client non si aspettano a vicenda neanche se una transazione resta aperta a lungo. Un conflitto viene segnalato al
+  `COMMIT` con `Neo.TransientError.Transaction.Outdated`, che i driver ritentano da soli nelle transazioni gestite
+  (`ExecuteWrite`). Le query di scrittura in auto-commit sono esclusive (non vengono mai rieseguite);
 - `neo4j://`: il server risponde a `ROUTE` indicando sé stesso come writer, reader e router;
 - tutti i tipi: nodi, relazioni e path (con element id `n:<id>` / `r:<id>`, gli stessi di `elementId()`), liste e mappe
   annidate, tipi temporali, durate e punti, sia nei risultati sia nei parametri;
 - errori con i codici di Neo4j (`Neo.ClientError.Statement.SyntaxError`, `…Schema.ConstraintValidationFailed`, …),
-  quindi la logica di retry dei driver funziona come con Neo4j.
+  quindi la logica di retry dei driver funziona come con Neo4j;
+- le query di amministrazione che gli strumenti inviano al database `system`: `CALL dbms.components()`,
+  `SHOW DATABASES`, `CALL dbms.showCurrentUser()` / `SHOW CURRENT USER`, `CALL dbms.clientConfig()`,
+  `SHOW PROCEDURES` / `SHOW FUNCTIONS`. Il server si presenta come Neo4j 5.26 community.
+
+### Neo4j Browser
+
+Neo4j Browser (per esempio <https://browser.neo4j.io>) si collega con i WebSocket. Una pagina servita in https accetta
+solo connessioni cifrate con un certificato di cui il browser si fida:
+
+1. avviare il server con TLS: `--tls-self-signed` (oppure `--tls-cert` con un certificato vero);
+2. con un certificato self-signed, aprire una volta `https://localhost:7687` e accettare il certificato (in alternativa
+   aggiungerlo ai certificati attendibili del sistema);
+3. in Neo4j Browser collegarsi a `neo4j+s://localhost:7687` (il server stampa il link già pronto).
+
+Una copia di Neo4j Browser servita in http (per esempio da Neo4j Desktop) può usare anche `neo4j://` senza TLS.
 
 Limiti del server:
-- niente TLS (`bolt+s://`, `neo4j+s://`) e niente WebSocket: Neo4j Browser non si collega, i driver sì;
-- un solo database per processo; `SHOW DATABASES` e il database `system` non esistono;
-- i risultati vengono materializzati prima dello streaming, quindi una query che restituisce milioni di righe le tiene
-  in memoria;
-- come nella libreria, le transazioni di scrittura sono serializzate: una transazione esplicita di scrittura lasciata
-  aperta da un client blocca gli altri scrittori finché non termina.
+- un solo database per processo (più il database `system`, virtuale): Neo4j Enterprise ne gestisce più di uno nello
+  stesso server (`CREATE DATABASE`), qui per servire più database si avviano più server su porte diverse;
+- utenti e ruoli non esistono: c'è al massimo un utente (`--user` / `--password`) con tutti i permessi;
+- una query di scrittura in auto-commit tiene il turno di scrittura mentre il client legge il suo risultato.
 
 ## Prestazioni
 

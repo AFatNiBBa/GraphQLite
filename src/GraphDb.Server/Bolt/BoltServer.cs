@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 
 namespace GraphDb.Server.Bolt;
 
@@ -24,13 +25,24 @@ public sealed class BoltServerOptions
     /// </summary>
     public string ServerAgent { get; init; } = "Neo4j/5.26.0";
 
+    /// <summary>
+    /// Certificate (with private key) for TLS: clients may then use <c>bolt+s://</c>, <c>neo4j+s://</c> and secure
+    /// WebSockets. TLS is detected from the first byte, so the same port also accepts plain connections unless
+    /// <see cref="RequireTls"/> is set. See <see cref="TlsCertificates"/>.
+    /// </summary>
+    public X509Certificate2? Certificate { get; init; }
+
+    /// <summary>Rejects unencrypted connections (only with a <see cref="Certificate"/>).</summary>
+    public bool RequireTls { get; init; }
+
     /// <summary>Receives unexpected connection errors.</summary>
     public Action<string>? Log { get; init; }
 }
 
 /// <summary>
 /// Serves a <see cref="GraphDatabase"/> over the Bolt protocol, so that Neo4j drivers and tools can use it
-/// through <c>bolt://</c> and <c>neo4j://</c> URIs. One thread per connection.
+/// through <c>bolt://</c> and <c>neo4j://</c> URIs (and their <c>+s</c> variants with TLS). The same port accepts
+/// raw Bolt, Bolt over WebSocket (Neo4j Browser) and TLS. One thread per connection.
 /// </summary>
 public sealed class BoltServer : IDisposable
 {

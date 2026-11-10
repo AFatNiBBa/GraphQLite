@@ -13,13 +13,12 @@ internal sealed class BoltClientException(string code, string message) : Excepti
 /// <summary>
 /// One Bolt connection, served by a dedicated thread: a write transaction may wait on the writer gate, which
 /// would starve the thread pool.
-/// Implements Bolt 4.4 and 5.0–5.4: handshake, chunking, HELLO/LOGON/LOGOFF, RUN/PULL/DISCARD, explicit
-/// transactions, RESET, ROUTE (so that <c>neo4j://</c> URIs work) and TELEMETRY.
+/// Implements Bolt 4.4 and 5.0–5.4 over TCP, TLS and WebSocket: handshake, chunking, HELLO/LOGON/LOGOFF,
+/// RUN/PULL/DISCARD with streamed results, explicit transactions, RESET, ROUTE (so that <c>neo4j://</c> URIs work)
+/// and TELEMETRY.
 /// </summary>
 internal sealed class BoltConnection : IDisposable
 {
-    private const uint Magic = 0x6060B017;
-
     private enum Msg : byte
     {
         Hello = 0x01, Goodbye = 0x02, Reset = 0x0F, Run = 0x10, Begin = 0x11, Commit = 0x12, Rollback = 0x13,
@@ -32,7 +31,7 @@ internal sealed class BoltConnection : IDisposable
     private static readonly (int Major, int Minor)[] Supported = [(5, 4), (5, 3), (5, 2), (5, 1), (5, 0), (4, 4)];
 
     private readonly Socket _socket;
-    private readonly NetworkStream _stream;
+    private Stream _stream;
     private readonly BoltServer _server;
     private readonly string _id;
     private readonly PackWriter _w = new();
@@ -45,18 +44,26 @@ internal sealed class BoltConnection : IDisposable
     private int _major, _minor;
     private bool _utc;
     private bool _hello, _authenticated, _failed;
+    private string? _user;
 
     private Transaction? _tx;
+    private string _txDb = "";
     private readonly List<ResultStream> _results = new();
     private ResultStream? _auto;
     private long _nextQid;
 
-    private sealed class ResultStream(QueryResult result, long qid, long tFirst)
+    /// <summary>An open result: a streamed query, or rows computed by the server (system queries).</summary>
+    private sealed class ResultStream(QueryCursor? cursor, Queue<Value[]>? rows, long qid, long tFirst, string db)
     {
-        public readonly QueryResult Result = result;
+        public readonly QueryCursor? Cursor = cursor;
+        public readonly Queue<Value[]>? Rows = rows;
         public readonly long Qid = qid;
         public readonly long TFirst = tFirst;
-        public int Pos;
+        public readonly string Db = db;
+
+        public Value[]? Next() => Cursor != null ? Cursor.NextValues() : Rows!.TryDequeue(out var r) ? r : null;
+        public QueryStatistics Statistics => Cursor?.Statistics ?? QueryStatistics.Empty;
+        public void Dispose() => Cursor?.Dispose();
     }
 
     public BoltConnection(Socket socket, BoltServer server, string id)
@@ -75,6 +82,7 @@ internal sealed class BoltConnection : IDisposable
     {
         try
         {
+            if (Transport.Negotiate(_socket, ref _stream, _server.Options, out _) == Transport.Kind.Closed) return;
             if (!Handshake()) return;
             while (ReadMessage(out int length))
             {
@@ -83,7 +91,8 @@ internal sealed class BoltConnection : IDisposable
             }
             Flush();
         }
-        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or BoltProtocolException)
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException or BoltProtocolException
+            or System.Security.Authentication.AuthenticationException)
         {
             // client went away or spoke garbage: just close
         }
@@ -100,9 +109,11 @@ internal sealed class BoltConnection : IDisposable
     /// <summary>Called by the connection thread when it ends: rolls back an open transaction.</summary>
     public void Dispose()
     {
+        try { DropResults(); } catch { }
         try { _tx?.Dispose(); } catch { }
         _tx = null;
-        _stream.Dispose();
+        try { _stream.Dispose(); } catch { }
+        _socket.Dispose();
         _server.Remove(this);
     }
 
@@ -110,27 +121,28 @@ internal sealed class BoltConnection : IDisposable
     public void Close()
     {
         try { _socket.Shutdown(SocketShutdown.Both); } catch { }
-        _stream.Dispose();
+        try { _socket.Close(); } catch { }
     }
 
     // ================================================================== framing
 
+    /// <summary>Version negotiation (the 4-byte magic preamble was consumed by <see cref="Transport"/>).</summary>
     private bool Handshake()
     {
-        Span<byte> hs = stackalloc byte[20];
+        Span<byte> hs = stackalloc byte[16];
         ReadExactly(hs);
-        if (BinaryPrimitives.ReadUInt32BigEndian(hs) != Magic) return false;
         for (int i = 0; i < 4; i++)
         {
-            var p = hs.Slice(4 + 4 * i, 4);
+            var p = hs.Slice(4 * i, 4);
             int major = p[3], minor = p[2], range = p[1];
             foreach (var (sMajor, sMinor) in Supported)
             {
                 if (sMajor != major || sMinor > minor || sMinor < minor - range) continue;
                 _major = sMajor;
                 _minor = sMinor;
-                Span<byte> reply = [0, 0, (byte)sMinor, (byte)sMajor];
-                _stream.Write(reply);
+                // a single write: over WebSocket the reply must arrive as one message
+                _stream.Write([0, 0, (byte)sMinor, (byte)sMajor]);
+                _stream.Flush();
                 return true;
             }
         }
@@ -222,6 +234,7 @@ internal sealed class BoltConnection : IDisposable
     {
         if (_outLen == 0) return;
         _stream.Write(_out, 0, _outLen);
+        _stream.Flush();
         _outLen = 0;
     }
 
@@ -321,25 +334,44 @@ internal sealed class BoltConnection : IDisposable
         }
         catch (BoltClientException ex)
         {
+            FailAutoCommit();
             SendFailure(ex.Code, ex.Message);
             return !ex.Code.StartsWith("Neo.ClientError.Security.", StringComparison.Ordinal);
         }
-        catch (Exception ex) when (ex is GraphDbException or OperationCanceledException or ArgumentException or InvalidCastException)
+        catch (Exception ex) when (ex is GraphDbException or OperationCanceledException or ArgumentException or InvalidCastException
+            or InvalidOperationException or OverflowException or FormatException or KeyNotFoundException)
         {
+            FailAutoCommit();
             var (code, text) = ErrorCode(ex);
             SendFailure(code, text);
             return true;
         }
     }
 
+    /// <summary>An auto-commit query failed: its transaction is rolled back (the cursor already did it, this is a safety net).</summary>
+    private void FailAutoCommit()
+    {
+        var auto = _auto;
+        _auto = null;
+        try { auto?.Dispose(); } catch { }
+    }
+
     private static Dictionary<string, object?> Map(object?[] fields, int i) =>
         i < fields.Length && fields[i] is Dictionary<string, object?> m ? m : new Dictionary<string, object?>();
+
+    private void DropResults()
+    {
+        var auto = _auto;
+        _auto = null;
+        auto?.Dispose();
+        // results of an explicit transaction end with it
+        _results.Clear();
+    }
 
     private void ResetState()
     {
         _failed = false;
-        _auto = null;
-        _results.Clear();
+        try { DropResults(); } catch { }
         if (_tx != null)
         {
             try { _tx.Dispose(); } catch { }
@@ -378,6 +410,7 @@ internal sealed class BoltConnection : IDisposable
     private bool Authenticate(Dictionary<string, object?> auth)
     {
         var o = _server.Options;
+        _user = auth.GetValueOrDefault("principal") as string;
         if (o.Username is null)
         {
             _authenticated = true;
@@ -396,10 +429,13 @@ internal sealed class BoltConnection : IDisposable
         return true;
     }
 
-    private void CheckDatabase(Dictionary<string, object?> extra)
+    /// <summary>Validates the requested database: the served one (default) or <c>system</c>. Returns its name.</summary>
+    private string CheckDatabase(string? db)
     {
-        if (extra.GetValueOrDefault("db") is string db && db.Length > 0 && !string.Equals(db, _server.Options.DatabaseName, StringComparison.OrdinalIgnoreCase))
-            throw new BoltClientException("Neo.ClientError.Database.DatabaseNotFound", $"Database does not exist. Database name: '{db}'.");
+        var name = _server.Options.DatabaseName;
+        if (string.IsNullOrEmpty(db) || string.Equals(db, name, StringComparison.OrdinalIgnoreCase)) return name;
+        if (string.Equals(db, "system", StringComparison.OrdinalIgnoreCase)) return "system";
+        throw new BoltClientException("Neo.ClientError.Database.DatabaseNotFound", $"Database does not exist. Database name: '{db}'.");
     }
 
     private static Dictionary<string, object?> Parameters(Dictionary<string, object?> raw)
@@ -409,26 +445,47 @@ internal sealed class BoltConnection : IDisposable
         return p;
     }
 
+    private string Address => _server.Options.AdvertisedAddress ?? _socket.LocalEndPoint?.ToString() ?? "localhost:7687";
+
     private void Run(string query, Dictionary<string, object?> rawParams, Dictionary<string, object?> extra)
     {
         if (_auto != null || (_tx is null && _results.Count > 0)) throw new BoltProtocolException("RUN while a result is still open");
-        var parameters = Parameters(rawParams);
         long start = Stopwatch.GetTimestamp();
-        QueryResult result;
-        if (_tx != null)
+        string db = _tx != null ? _txDb : CheckDatabase(extra.GetValueOrDefault("db") as string);
+        ResultStream rs;
+        if (SystemQueries.TryAnswer(query, _server, _user, Address) is { } sys)
         {
-            result = _tx.Execute(query, parameters);
-            var rs = new ResultStream(result, _nextQid++, (long)Stopwatch.GetElapsedTime(start).TotalMilliseconds);
-            _results.Add(rs);
-            SendSuccess(new Dictionary<string, object?> { ["fields"] = result.Columns.ToList<object?>(), ["t_first"] = rs.TFirst, ["qid"] = rs.Qid });
+            rs = new ResultStream(null, new Queue<Value[]>(sys.Rows), _tx != null ? _nextQid++ : -1, 0, db);
+            Started(rs, sys.Columns);
             return;
         }
-        CheckDatabase(extra);
+        var parameters = Parameters(rawParams);
+        if (_tx != null)
+        {
+            var cursor = _tx.Stream(query, parameters);
+            rs = new ResultStream(cursor, null, _nextQid++, Elapsed(start), db);
+            Started(rs, cursor.Columns);
+            return;
+        }
         if (extra.GetValueOrDefault("mode") as string == "r" && Db.GetStatement(query).IsWrite)
             throw new BoltClientException("Neo.ClientError.Statement.AccessMode", "Writing in read access mode not allowed.");
-        result = Db.Execute(query, parameters);
-        _auto = new ResultStream(result, -1, (long)Stopwatch.GetElapsedTime(start).TotalMilliseconds);
-        SendSuccess(new Dictionary<string, object?> { ["fields"] = result.Columns.ToList<object?>(), ["t_first"] = _auto.TFirst });
+        var auto = Db.Stream(query, parameters);
+        rs = new ResultStream(auto, null, -1, Elapsed(start), db);
+        Started(rs, auto.Columns);
+    }
+
+    private static long Elapsed(long start) => (long)Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+
+    private void Started(ResultStream rs, IReadOnlyList<string> columns)
+    {
+        var meta = new Dictionary<string, object?> { ["fields"] = columns.ToList<object?>(), ["t_first"] = rs.TFirst };
+        if (_tx != null)
+        {
+            _results.Add(rs);
+            meta["qid"] = rs.Qid;
+        }
+        else _auto = rs;
+        SendSuccess(meta);
     }
 
     private void Pull(Dictionary<string, object?> extra, bool discard)
@@ -443,32 +500,36 @@ internal sealed class BoltConnection : IDisposable
             if (i < 0) throw new BoltProtocolException("PULL without a result");
             rs = _results[i];
         }
-        var rows = rs.Result;
-        int end = n < 0 ? rows.Count : (int)Math.Min(rows.Count, rs.Pos + n);
-        if (!discard)
+        bool more = false;
+        if (discard)
         {
-            for (int i = rs.Pos; i < end; i++)
+            rs.Dispose(); // stops a read query; an updating query still runs to the end
+        }
+        else
+        {
+            for (long sent = 0; n < 0 || sent < n; sent++)
             {
-                var values = rows[i].Values;
+                var values = rs.Next();
+                if (values is null) break;
                 _w.StructHeader(1, Record);
-                _w.ListHeader(values.Count);
-                for (int k = 0; k < values.Count; k++) BoltValues.Write(_w, values[k], V5, _utc);
-                Send();
+                _w.ListHeader(values.Length);
+                foreach (var v in values) BoltValues.Write(_w, v, V5, _utc);
+                Send(); // flushes to the socket every 64 KB: rows are streamed, not accumulated
+                if (n >= 0 && sent + 1 == n) more = !PeekEnd(rs);
             }
         }
-        else end = rows.Count;
-        rs.Pos = end;
-        if (end < rows.Count)
+        if (more)
         {
             SendSuccess(new Dictionary<string, object?> { ["has_more"] = true });
             return;
         }
-        var stats = rows.Statistics;
+        rs.Dispose();
+        var stats = rs.Statistics;
         var meta = new Dictionary<string, object?>
         {
             ["type"] = stats.IndexesAdded + stats.IndexesRemoved > 0 ? "s" : stats.ContainsUpdates ? "rw" : "r",
             ["t_last"] = 0L,
-            ["db"] = _server.Options.DatabaseName,
+            ["db"] = rs.Db,
         };
         if (stats.ContainsUpdates) meta["stats"] = Stats(stats);
         if (_tx is null)
@@ -479,6 +540,10 @@ internal sealed class BoltConnection : IDisposable
         else _results.Remove(rs);
         SendSuccess(meta);
     }
+
+    /// <summary>True when the result has no more rows (the cursor reports completion once the last row was produced).</summary>
+    private static bool PeekEnd(ResultStream rs) =>
+        rs.Cursor is { } c ? c.IsCompleted && !c.HasBufferedRows : rs.Rows!.Count == 0;
 
     private static Dictionary<string, object?> Stats(QueryStatistics s)
     {
@@ -500,11 +565,15 @@ internal sealed class BoltConnection : IDisposable
         return d;
     }
 
+    /// <summary>
+    /// Explicit transaction. Write transactions are concurrent: clients do not wait for each other, and a transaction
+    /// that conflicts with one committed in the meantime fails at COMMIT with a transient error that drivers retry.
+    /// </summary>
     private void Begin(Dictionary<string, object?> extra)
     {
         if (_tx != null || _auto != null) throw new BoltProtocolException("BEGIN inside a transaction");
-        CheckDatabase(extra);
-        _tx = extra.GetValueOrDefault("mode") as string == "r" ? Db.BeginReadTransaction() : Db.BeginTransaction();
+        _txDb = CheckDatabase(extra.GetValueOrDefault("db") as string);
+        _tx = extra.GetValueOrDefault("mode") as string == "r" ? Db.BeginReadTransaction() : Db.BeginConcurrentTransaction();
         _results.Clear();
         _nextQid = 0;
         SendSuccess();
@@ -537,11 +606,10 @@ internal sealed class BoltConnection : IDisposable
             string s => s,
             _ => null,
         };
-        if (db != null) CheckDatabase(new Dictionary<string, object?> { ["db"] = db });
+        db = CheckDatabase(db);
         string address = _server.Options.AdvertisedAddress
             ?? routing.GetValueOrDefault("address") as string
-            ?? _socket.LocalEndPoint?.ToString()
-            ?? "localhost:7687";
+            ?? Address;
         var addresses = new List<object?> { address };
         var servers = new List<object?>
         {
@@ -551,7 +619,7 @@ internal sealed class BoltConnection : IDisposable
         };
         SendSuccess(new Dictionary<string, object?>
         {
-            ["rt"] = new Dictionary<string, object?> { ["ttl"] = 300L, ["db"] = _server.Options.DatabaseName, ["servers"] = servers },
+            ["rt"] = new Dictionary<string, object?> { ["ttl"] = 300L, ["db"] = db, ["servers"] = servers },
         });
     }
 
@@ -561,13 +629,16 @@ internal sealed class BoltConnection : IDisposable
         CypherSyntaxException => ("Neo.ClientError.Statement.SyntaxError", ex.Message),
         CypherSemanticException when ex.Message.StartsWith("Expected parameter", StringComparison.Ordinal) =>
             ("Neo.ClientError.Statement.ParameterMissing", ex.Message),
+        CypherSemanticException when ex.Message.Contains("procedure", StringComparison.OrdinalIgnoreCase) =>
+            ("Neo.ClientError.Procedure.ProcedureNotFound", ex.Message),
         CypherSemanticException => ("Neo.ClientError.Statement.SemanticError", ex.Message),
         CypherRuntimeException => ("Neo.ClientError.Statement.ArgumentError", ex.Message),
         ConstraintViolationException => ("Neo.ClientError.Schema.ConstraintValidationFailed", ex.Message),
+        TransactionConflictException => ("Neo.TransientError.Transaction.Outdated", ex.Message),
         GraphDbException when ex.Message.Contains("read-only transaction", StringComparison.Ordinal) =>
             ("Neo.ClientError.Statement.AccessMode", ex.Message),
         GraphDbException => ("Neo.ClientError.Statement.ExecutionFailed", ex.Message),
         OperationCanceledException => ("Neo.TransientError.Transaction.Terminated", ex.Message),
-        _ => ("Neo.ClientError.Request.Invalid", ex.Message),
+        _ => ("Neo.ClientError.Statement.ArgumentError", ex.Message),
     };
 }

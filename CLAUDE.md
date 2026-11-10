@@ -31,7 +31,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - `src/GraphDb/Runtime`: operatori pull (`ReadOperators`, `WriteOperators`, `LoadCsv`), `Functions`, `Aggregation`, `Procedures`, `Core` (`ExecContext`)
 - `GraphDatabase.cs` (apertura, opzioni, cache dei piani, checkpoint), `Transaction.cs`, `QueryResult.cs`
 - `GraphDatabase.cs` / `Transaction.cs` / `QueryCursor.cs`: `Execute` materializza passando da `QueryCursor` (streaming); `StatementLog` registra le query delle transazioni concorrenti
-- `src/GraphDb.Server/Bolt`: server Bolt 4.4 / 5.0–5.4 (`PackStream`, `BoltValues` per la conversione dei valori, `BoltConnection` con la macchina a stati, `BoltServer`); `Program.cs` è la CLI. Accede agli internal della libreria (`InternalsVisibleTo`)
+- `src/GraphDb.Server/Bolt`: server Bolt 4.4 / 5.0–5.4 (`PackStream`, `BoltValues` per la conversione dei valori, `BoltConnection` con la macchina a stati, `BoltServer`, `Transport` che riconosce TLS / Bolt / WebSocket / HTTP sulla stessa porta, `SystemQueries` per le query del database `system` usate da Neo4j Browser, `TlsCertificates`); `Program.cs` è la CLI. Accede agli internal della libreria (`InternalsVisibleTo`)
 
 ## Architettura (da sapere prima di toccare lo storage)
 - Un database è una **directory** con `data`, `nodes`, `rels` (pagine da 8 KB) e `wal`. `GraphDatabase.OpenInMemory()` usa segmenti di memoria nativa al posto dei file
@@ -60,6 +60,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - Gli aggregatori nuovi devono implementare `Merge`; `DistinctAgg.Merge` si appoggia all'ordine di inserimento di `HashSet` (vale finché non si rimuovono elementi)
 - Server Bolt: `localhost` risolve prima a `::1`, per questo `BoltServer` ascolta anche sul loopback IPv6 (senza, ogni connessione dei driver aspetta ~2 s). L'agent di default è `Neo4j/5.26.0` perché alcuni driver decidono le funzionalità dalla versione. Gli element id sono `n:<id>` / `r:<id>`, come `elementId()`: vanno cambiati insieme
 - `QueryCursor`: una sola query aperta per transazione; iniziarne un'altra (o il commit) chiama `Detach` / `Dispose` su quella aperta. `Dispose` prima della fine ferma una lettura ma porta sempre a termine una scrittura. Un cursore di `db.Stream` possiede la sua transazione e la chiude a fine risultato
+- Neo4j Browser (fonte: sorgenti del Browser 2025.x): legge la versione da `dbms.components()` `versions[0]` (non dall'agent), interroga `SHOW DATABASES` sul db `system` (anche scritto `SYSTEM`), `dbms.showCurrentUser()` deve restituire una riga; su una pagina https accetta solo `neo4j+s` / `bolt+s` con certificato fidato; via WebSocket la risposta di 4 byte dell'handshake deve arrivare in **un solo** messaggio
 - I test con `Neo4j.Driver` importano `using Neo4j.Driver;` per `As<T>()`: i tipi omonimi (`GraphDatabase`, `Node`…) si risolvono comunque su `GraphDb` perché il namespace contenitore ha la precedenza; per i tipi del driver usare l'alias `N.`
 - `Path` collide con `System.IO.Path`: il tipo dei percorsi si chiama `GraphPath`, ma il membro dell'enum resta `ValueKind.Path`
 

@@ -183,7 +183,7 @@ public sealed class BoltTests : IAsyncLifetime
         await using var session = _driver.AsyncSession(o => o.WithDefaultAccessMode(N.AccessMode.Read));
         var ex = await Assert.ThrowsAnyAsync<N.Neo4jException>(async () => await (await session.RunAsync("CREATE (:X)")).ConsumeAsync());
         Assert.Equal("Neo.ClientError.Statement.AccessMode", ex.Code);
-        await Assert.ThrowsAnyAsync<N.Neo4jException>(() => session.ExecuteReadAsync(tx => tx.RunAsync("CREATE (:X)")));
+        await Assert.ThrowsAnyAsync<N.Neo4jException>(() => session.ExecuteReadAsync(async tx => await (await tx.RunAsync("CREATE (:X)")).ConsumeAsync()));
         Assert.Equal(0L, _db.ExecuteScalar<long>("MATCH (x:X) RETURN count(x)"));
     }
 
@@ -320,5 +320,264 @@ public sealed class BoltTests : IAsyncLifetime
         Assert.Equal("Neo.ClientError.Database.DatabaseNotFound", ex.Code);
         await using var named = _driver.AsyncSession(o => o.WithDatabase("neo4j"));
         Assert.Equal(1L, (await (await named.RunAsync("RETURN 1 AS x")).SingleAsync())["x"].As<long>());
+    }
+
+    // ------------------------------------------------------------------ Neo4j Browser
+
+    /// <summary>The queries Neo4j Browser sends after connecting and while showing results.</summary>
+    [Fact]
+    public async Task Neo4j_Browser_Queries()
+    {
+        await Run("CREATE (a:Person {name: 'a'})-[:KNOWS]->(b:Person {name: 'b'})-[:KNOWS]->(c:City {name: 'c'})");
+        async Task<List<N.IRecord>> Sys(string q, string db = "system")
+        {
+            await using var session = _driver.AsyncSession(o => o.WithDatabase(db).WithDefaultAccessMode(N.AccessMode.Read));
+            return await session.ExecuteReadAsync(async tx => await (await tx.RunAsync(q)).ToListAsync());
+        }
+        var components = (await Sys("CALL dbms.components() YIELD name, versions, edition")).Single();
+        Assert.Equal("5.26.0", components["versions"].As<List<string>>()[0]);
+        Assert.Equal("community", components["edition"].As<string>());
+
+        var dbs = await Sys("SHOW DATABASES");
+        Assert.Equal(["neo4j", "system"], dbs.Select(r => r["name"].As<string>()));
+        Assert.True(dbs[0]["default"].As<bool>());
+        Assert.Equal("online", dbs[0]["currentStatus"].As<string>());
+        await Sys("SHOW DATABASES", "SYSTEM"); // the connection check uses upper case
+
+        Assert.Single(await Sys("CALL dbms.showCurrentUser()"));
+        Assert.Contains(await Sys("CALL dbms.clientConfig()"), r => r["name"].As<string>() == "dbms.security.auth_enabled");
+        Assert.Contains(await Sys("SHOW PROCEDURES yield name, description, signature"), r => r["name"].As<string>() == "db.labels");
+        await Sys("SHOW FUNCTIONS yield name, description, signature");
+
+        var meta = await Run("""
+            CALL db.labels() YIELD label
+            RETURN {name:'labels', data:COLLECT(label)[..1000]} AS result
+            UNION ALL
+            CALL db.relationshipTypes() YIELD relationshipType
+            RETURN {name:'relationshipTypes', data:COLLECT(relationshipType)[..1000]} AS result
+            UNION ALL
+            CALL db.propertyKeys() YIELD propertyKey
+            RETURN {name:'propertyKeys', data:COLLECT(propertyKey)[..1000]} AS result
+            """);
+        Assert.Equal(3, meta.Count);
+        Assert.Equal(["City", "Person"], meta[0]["result"].As<Dictionary<string, object>>()["data"].As<List<string>>().Order());
+        var counts = await Run("""
+            MATCH () RETURN { name:'nodes', data:count(*) } AS result
+            UNION ALL
+            MATCH ()-[]->() RETURN { name:'relationships', data: count(*)} AS result
+            """);
+        Assert.Equal(3L, counts[0]["result"].As<Dictionary<string, object>>()["data"].As<long>());
+        Assert.Equal(2L, counts[1]["result"].As<Dictionary<string, object>>()["data"].As<long>());
+
+        // graph view: relationships between the displayed nodes, then neighbour expansion
+        var ids = (await Run("MATCH (n) RETURN id(n) AS id")).Select(r => r["id"].As<long>()).ToList();
+        var rels = await Sys("MATCH (a)-[r]->(b) WHERE id(a) IN [" + string.Join(",", ids) + "] AND id(b) IN [" + string.Join(",", ids) + "] RETURN r;", "neo4j");
+        Assert.Equal(2, rels.Count);
+        await using (var session = _driver.AsyncSession(o => o.WithDefaultAccessMode(N.AccessMode.Read)))
+        {
+            var withParams = await session.ExecuteReadAsync(async tx => await (await tx.RunAsync(
+                "MATCH (a)-[r]->(b) WHERE id(a) IN $existingNodeIds AND id(b) IN $newNodeIds RETURN r;",
+                new { existingNodeIds = ids, newNodeIds = ids })).ToListAsync());
+            Assert.Equal(2, withParams.Count);
+        }
+        long b = (await Run("MATCH (n {name: 'b'}) RETURN id(n) AS id"))[0]["id"].As<long>();
+        long a = (await Run("MATCH (n {name: 'a'}) RETURN id(n) AS id"))[0]["id"].As<long>();
+        var expand = await Run($"""
+            MATCH (a) WHERE id(a) = {b}
+            WITH a, size([(a)--() | 1]) AS allNeighboursCount
+            MATCH path = (a)--(o) WHERE NOT id(o) IN [{a}]
+            RETURN path, allNeighboursCount
+            ORDER BY id(o)
+            LIMIT 100
+            """);
+        Assert.Single(expand);
+        Assert.Equal(2L, expand[0]["allNeighboursCount"].As<long>());
+    }
+
+    [Fact]
+    public async Task Http_Request_Gets_The_Discovery_Document()
+    {
+        using var http = new HttpClient();
+        var json = await http.GetStringAsync($"http://{Address}/");
+        Assert.Contains($"\"bolt_direct\":\"bolt://{Address}\"", json);
+        Assert.Contains("\"neo4j_version\":\"5.26.0\"", json);
+    }
+
+    // ------------------------------------------------------------------ WebSocket and TLS
+
+    /// <summary>Minimal Bolt 5 client over any stream (raw TCP, TLS or WebSocket).</summary>
+    private sealed class RawBolt(Stream s)
+    {
+        private readonly PackWriter _w = new();
+
+        public void Handshake()
+        {
+            s.Write([0x60, 0x60, 0xB0, 0x17, 0, 4, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            var version = new byte[4];
+            s.ReadExactly(version);
+            Assert.Equal(new byte[] { 0, 0, 4, 5 }, version);
+        }
+
+        public void Send(byte tag, params Action<PackWriter>[] fields)
+        {
+            _w.Reset();
+            _w.StructHeader(fields.Length, tag);
+            foreach (var f in fields) f(_w);
+            var data = _w.Written.ToArray();
+            var frame = new byte[data.Length + 4];
+            frame[0] = (byte)(data.Length >> 8);
+            frame[1] = (byte)data.Length;
+            data.CopyTo(frame, 2);
+            s.Write(frame);
+        }
+
+        public PackStruct Receive()
+        {
+            var msg = new List<byte>();
+            var h = new byte[2];
+            while (true)
+            {
+                s.ReadExactly(h);
+                int n = h[0] << 8 | h[1];
+                if (n == 0) break;
+                var chunk = new byte[n];
+                s.ReadExactly(chunk);
+                msg.AddRange(chunk);
+            }
+            return (PackStruct)new PackReader(msg.ToArray()).Read()!;
+        }
+
+        /// <summary>HELLO, LOGON, then RUN + PULL of a query; returns the first column of each record.</summary>
+        public List<object?> Query(string query)
+        {
+            Send(0x01, w => w.Meta(new Dictionary<string, object?> { ["user_agent"] = "raw/1.0" }));
+            Assert.Equal(0x70, Receive().Tag);
+            Send(0x6A, w => w.Meta(new Dictionary<string, object?> { ["scheme"] = "none" }));
+            Assert.Equal(0x70, Receive().Tag);
+            Send(0x10, w => w.String(query), w => w.MapHeader(0), w => w.MapHeader(0));
+            Assert.Equal(0x70, Receive().Tag);
+            Send(0x3F, w => w.Meta(new Dictionary<string, object?> { ["n"] = -1L }));
+            var values = new List<object?>();
+            while (true)
+            {
+                var m = Receive();
+                if (m.Tag != 0x71)
+                {
+                    Assert.Equal(0x70, m.Tag);
+                    return values;
+                }
+                values.Add(((List<object?>)m.Fields[0]!)[0]);
+            }
+        }
+    }
+
+    private static async Task<Stream> WebSocket(Uri uri, bool trustAll = false)
+    {
+        var ws = new System.Net.WebSockets.ClientWebSocket();
+        if (trustAll) ws.Options.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+        await ws.ConnectAsync(uri, CancellationToken.None);
+        return new WebSocketByteStream(ws);
+    }
+
+    [Fact]
+    public async Task Bolt_Over_WebSocket()
+    {
+        using var s = await WebSocket(new Uri($"ws://{Address}"));
+        var bolt = new RawBolt(s);
+        bolt.Handshake();
+        Assert.Equal([1L, 2L, 3L], bolt.Query("UNWIND [1, 2, 3] AS x RETURN x"));
+    }
+
+    [Fact]
+    public async Task Tls_For_Drivers_And_WebSockets()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "gdbtls_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var cert = TlsCertificates.SelfSigned(Path.Combine(dir, "cert.pfx"));
+            Assert.Equal(cert.Thumbprint, TlsCertificates.SelfSigned(Path.Combine(dir, "cert.pfx")).Thumbprint); // reused
+            using var server = new BoltServer(_db, new BoltServerOptions { Listen = new IPEndPoint(IPAddress.Loopback, 0), Certificate = cert });
+            server.Start();
+            string address = $"localhost:{server.LocalEndpoint.Port}";
+            foreach (var scheme in new[] { "bolt+ssc", "neo4j+ssc", "bolt" })
+            {
+                await using var driver = N.GraphDatabase.Driver($"{scheme}://{address}", N.AuthTokens.None);
+                Assert.Equal(42L, (await Run("RETURN 42 AS x", driver: driver))[0]["x"].As<long>());
+            }
+            using (var s = await WebSocket(new Uri($"wss://{address}"), trustAll: true))
+            {
+                var bolt = new RawBolt(s);
+                bolt.Handshake();
+                Assert.Equal(["tls"], bolt.Query("RETURN 'tls'"));
+            }
+            using var handler = new HttpClientHandler { ServerCertificateCustomValidationCallback = (_, _, _, _) => true };
+            using var http = new HttpClient(handler);
+            Assert.Contains("bolt+s://", await http.GetStringAsync($"https://{address}/"));
+
+            using var strict = new BoltServer(_db, new BoltServerOptions
+            {
+                Listen = new IPEndPoint(IPAddress.Loopback, 0),
+                Certificate = cert,
+                RequireTls = true,
+            });
+            strict.Start();
+            await using var plain = N.GraphDatabase.Driver($"bolt://localhost:{strict.LocalEndpoint.Port}", N.AuthTokens.None);
+            await Assert.ThrowsAnyAsync<Exception>(() => plain.VerifyConnectivityAsync());
+        }
+        finally
+        {
+            try { Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    // ------------------------------------------------------------------ streaming and concurrency
+
+    [Fact]
+    public async Task Huge_Result_Is_Streamed()
+    {
+        await using var session = _driver.AsyncSession(o => o.WithFetchSize(10_000));
+        var cursor = await session.RunAsync("UNWIND range(1, 2000000) AS i RETURN i");
+        long n = 0, sum = 0;
+        while (await cursor.FetchAsync())
+        {
+            n++;
+            sum += cursor.Current["i"].As<long>();
+        }
+        Assert.Equal(2000000, n);
+        Assert.Equal(2000000L * 2000001 / 2, sum);
+    }
+
+    [Fact]
+    public async Task Open_Write_Transactions_Do_Not_Block_Each_Other()
+    {
+        await using var s1 = _driver.AsyncSession();
+        await using var s2 = _driver.AsyncSession();
+        var t1 = await s1.BeginTransactionAsync();
+        var t2 = await s2.BeginTransactionAsync(); // with exclusive writers this would wait for t1
+        await (await t1.RunAsync("CREATE (:T {n: 1})")).ConsumeAsync();
+        await (await t2.RunAsync("CREATE (:T {n: 2})")).ConsumeAsync();
+        await t2.CommitAsync();
+        await t1.CommitAsync();
+        Assert.Equal(2L, _db.ExecuteScalar<long>("MATCH (t:T) RETURN count(t)"));
+    }
+
+    [Fact]
+    public async Task Conflicting_Managed_Transactions_Are_Retried_By_The_Driver()
+    {
+        await Run("CREATE (:Counter {v: 0})");
+        var tasks = Enumerable.Range(0, 8).Select(async _ =>
+        {
+            for (int i = 0; i < 10; i++)
+            {
+                await using var session = _driver.AsyncSession();
+                await session.ExecuteWriteAsync(async tx =>
+                {
+                    var v = (await (await tx.RunAsync("MATCH (c:Counter) RETURN c.v AS v")).SingleAsync())["v"].As<long>();
+                    await (await tx.RunAsync("MATCH (c:Counter) SET c.v = $v", new { v = v + 1 })).ConsumeAsync();
+                });
+            }
+        });
+        await Task.WhenAll(tasks);
+        Assert.Equal(80L, _db.ExecuteScalar<long>("MATCH (c:Counter) RETURN c.v"));
     }
 }
