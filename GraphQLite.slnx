@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GraphQLite/GraphQLite.csproj" />
+    <Project Path="src/GraphQLite.Server/GraphQLite.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GraphQLite.Tests/GraphQLite.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/GraphQLite.Bench/GraphQLite.Bench.csproj" />
+    <Project Path="tools/GraphQLite.Shell/GraphQLite.Shell.csproj" />
+  </Folder>
+</Solution>

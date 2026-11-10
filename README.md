@@ -1,10 +1,10 @@
-# GraphDb
+# GraphQLite
 
 Graph database **embedded** (in-process, come SQLite) per .NET 10, interrogabile in **openCypher**.
 Il grafo vive in una directory di file memory-mapped e può essere molto più grande della RAM.
 
 ```csharp
-using GraphDb;
+using GraphQLite;
 
 using var db = GraphDatabase.Open("social.db");            // una directory; oppure GraphDatabase.OpenInMemory()
 
@@ -37,15 +37,15 @@ using (var cursor = db.Stream("MATCH (p:Person) RETURN p.name AS name"))  // rig
 
 | Percorso | Contenuto |
 |---|---|
-| `src/GraphDb` | la libreria |
-| `src/GraphDb.Server` | server **Bolt** (`bolt://` / `neo4j://`) da avviare su una directory del database |
-| `tests/GraphDb.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità, server Bolt con il driver ufficiale Neo4j |
-| `tools/GraphDb.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphDb.Shell -- mydb`) |
-| `tools/GraphDb.Bench` | benchmark (`dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [directory]`) |
+| `src/GraphQLite` | la libreria |
+| `src/GraphQLite.Server` | server **Bolt** (`bolt://` / `neo4j://`) da avviare su una directory del database |
+| `tests/GraphQLite.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità, server Bolt con il driver ufficiale Neo4j |
+| `tools/GraphQLite.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphQLite.Shell -- mydb`) |
+| `tools/GraphQLite.Bench` | benchmark (`dotnet run -c Release --project tools/GraphQLite.Bench -- 200000 5 [directory]`) |
 
 ```
-dotnet build GraphDb.slnx
-dotnet test  GraphDb.slnx
+dotnet build GraphQLite.slnx
+dotnet test  GraphQLite.slnx
 ```
 
 I test del server usano il pacchetto `Neo4j.Driver` (solo nel progetto di test: la libreria e il server non hanno
@@ -113,15 +113,15 @@ Un database è una **directory**:
 
 ## Server (Bolt)
 
-`GraphDb.Server` espone una directory del database con il protocollo **Bolt**, lo stesso di Neo4j: i driver ufficiali
+`GraphQLite.Server` espone una directory del database con il protocollo **Bolt**, lo stesso di Neo4j: i driver ufficiali
 (.NET, Java, Python, JavaScript, Go…) e gli strumenti che li usano si collegano con `bolt://` o `neo4j://` senza
-modifiche, quindi si può passare da Neo4j a GraphDb (e viceversa) cambiando solo l'indirizzo. Anche **Neo4j Browser**
+modifiche, quindi si può passare da Neo4j a GraphQLite (e viceversa) cambiando solo l'indirizzo. Anche **Neo4j Browser**
 si collega (vedi sotto).
 
 ```
-dotnet run -c Release --project src/GraphDb.Server -- mydb
-dotnet run -c Release --project src/GraphDb.Server -- mydb --host 0.0.0.0 --port 7687 --user neo4j --password secret
-dotnet run -c Release --project src/GraphDb.Server -- mydb --tls-self-signed
+dotnet run -c Release --project src/GraphQLite.Server -- mydb
+dotnet run -c Release --project src/GraphQLite.Server -- mydb --host 0.0.0.0 --port 7687 --user neo4j --password secret
+dotnet run -c Release --project src/GraphQLite.Server -- mydb --tls-self-signed
 ```
 
 | Opzione | Significato |
@@ -198,7 +198,7 @@ Con le query parallele conviene il **Server GC** (`<ServerGarbageCollection>true
 progetto dell'applicazione): le aggregazioni con molti gruppi allocano da più thread e con il GC workstation vanno
 circa a metà velocità. Il benchmark e il server lo usano già.
 
-Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 16 core; le misure oscillano tra un'esecuzione
+Risultati indicativi (`tools/GraphQLite.Bench`, 200k nodi / 1M relazioni, 16 core; le misure oscillano tra un'esecuzione
 e l'altra):
 
 | Operazione | In memoria | Su disco |
@@ -289,7 +289,7 @@ dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
 
 - **Un solo processo** per database: la directory è aperta in esclusiva. Più processi richiederebbero un indice delle
   versioni in shared memory e lock tra processi (come il file `-shm` di SQLite). Si può aggiungere, ma è un pezzo
-  di architettura a sé. Per condividere un database tra più processi o macchine si usa `GraphDb.Server`.
+  di architettura a sé. Per condividere un database tra più processi o macchine si usa `GraphQLite.Server`.
 - Le transazioni concorrenti rieseguono le query al commit se nel frattempo altri hanno committato: con molti
   scrittori che toccano gli stessi dati costano più delle esclusive e possono andare in conflitto ripetutamente.
   Gli id dei nodi e delle relazioni delle transazioni annullate o in conflitto non vengono riutilizzati.

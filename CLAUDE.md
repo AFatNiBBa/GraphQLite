@@ -1,37 +1,38 @@
-# GraphDb
+# GraphQLite
 
 Graph database **embedded** (in-process, come SQLite) per .NET 10, interrogabile in **openCypher**.
 Obiettivo dichiarato dall'utente: **il più veloce possibile**, sfruttando le funzionalità moderne di .NET (`Span`, `unsafe`, SIMD, memory-mapped file), con **letture concorrenti illimitate** e grafi più grandi della RAM.
 Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'utente finale: tenerlo allineato quando cambiano.
+Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'utente; la directory del repository è ancora `gdb`). Restano col vecchio nome, apposta, il magic su disco `"\0GRPGDB3"` in `Header` (cambiarlo renderebbe illeggibili i database esistenti) e il prefisso `GB:` dei bookmark Bolt.
 
 ## Stack
 - .NET 10, C# `latest`, `AllowUnsafeBlocks`, `IsAotCompatible`, `InvariantGlobalization`, nessuna dipendenza esterna nella libreria
-- Soluzione in formato **`.slnx`** (`GraphDb.slnx`): niente `.sln` (richiesta esplicita dell'utente)
-- Test con xUnit (`InternalsVisibleTo GraphDb.Tests`)
+- Soluzione in formato **`.slnx`** (`GraphQLite.slnx`): niente `.sln` (richiesta esplicita dell'utente)
+- Test con xUnit (`InternalsVisibleTo GraphQLite.Tests`)
 
 ## Comandi
-- `dotnet build GraphDb.slnx -c Release` (deve restare a 0 warning)
-- `dotnet test GraphDb.slnx -c Release`
-- `dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [directory]` → benchmark (senza directory: in memoria)
-- `dotnet run --project tools/GraphDb.Shell -- mydb` → REPL stile `sqlite3` (`-c "query"` per una sola query)
-- `dotnet run -c Release --project src/GraphDb.Server -- mydb [--port 7687] [--user u --password p]` → server Bolt
+- `dotnet build GraphQLite.slnx -c Release` (deve restare a 0 warning)
+- `dotnet test GraphQLite.slnx -c Release`
+- `dotnet run -c Release --project tools/GraphQLite.Bench -- 200000 5 [directory]` → benchmark (senza directory: in memoria)
+- `dotnet run --project tools/GraphQLite.Shell -- mydb` → REPL stile `sqlite3` (`-c "query"` per una sola query)
+- `dotnet run -c Release --project src/GraphQLite.Server -- mydb [--port 7687] [--user u --password p]` → server Bolt
 - Profiling: `dotnet-trace` (tool globale, in `%USERPROFILE%\.dotnet\tools`, non sempre nel PATH: `dotnet tool install -g dotnet-trace` se manca); formato speedscope analizzabile con uno script PowerShell che somma tempo self/inclusivo per frame. Nel formato speedscope il tempo self finisce nello pseudo-frame `CPU_TIME`: va attribuito al frame sottostante. I thread worker dei `Parallel.For` non hanno i frame del chiamante nello stack
 - Il benchmark esegue le query analitiche 5 volte e tiene la migliore, ma non arrivano al tier-1 del JIT: per misure stabili su una singola query serve un harness che la ripeta per secondi
 
 ## Struttura
-- `src/GraphDb/Storage`:
+- `src/GraphQLite/Storage`:
   - `Pager.cs`: `SegmentedSpace` (mmap a segmenti), `PageVersion` / `PageTable<T>` (overlay MVCC), `Pager`, `WriteTx` (copy-on-write, savepoint), `Wal`
   - `Layout.cs`: `Header` (256 byte), `NodeRec` (48 byte), `RelRec` (32 byte), `AdjBlock`, helper dei blob
   - `GraphStore.cs`: `IndexDef`, `Catalog`, `GraphStore`, `StoreTx` (tutto l'accesso ai record e tutte le mutazioni)
   - `BTree.cs`: chiavi order-preserving (`IndexKeys`) e B+tree
   - `HashIndex.cs`: indice hash (linear hashing) affiancato al B+tree degli indici unique
   - `RwLock.cs`: lock lettori/scrittore usato **solo** per l'esclusività del checkpoint
-- `src/GraphDb/Values`: `Value` (struct da 24 byte), `ValueOps` (uguaglianza, hash, ordinamento), `Temporal`, `Json`, `Entities` (`Node`, `Relationship`, `GraphPath`)
-- `src/GraphDb/Cypher`: `Lexer`, `Parser`, `Ast`, `Planner`, `ExprCompiler` (espressioni → closure)
-- `src/GraphDb/Runtime`: operatori pull (`ReadOperators`, `WriteOperators`, `LoadCsv`), `Functions`, `Aggregation`, `Procedures`, `Core` (`ExecContext`)
+- `src/GraphQLite/Values`: `Value` (struct da 24 byte), `ValueOps` (uguaglianza, hash, ordinamento), `Temporal`, `Json`, `Entities` (`Node`, `Relationship`, `GraphPath`)
+- `src/GraphQLite/Cypher`: `Lexer`, `Parser`, `Ast`, `Planner`, `ExprCompiler` (espressioni → closure)
+- `src/GraphQLite/Runtime`: operatori pull (`ReadOperators`, `WriteOperators`, `LoadCsv`), `Functions`, `Aggregation`, `Procedures`, `Core` (`ExecContext`)
 - `GraphDatabase.cs` (apertura, opzioni, cache dei piani, checkpoint), `Transaction.cs`, `QueryResult.cs`
 - `GraphDatabase.cs` / `Transaction.cs` / `QueryCursor.cs`: `Execute` materializza passando da `QueryCursor` (streaming); `StatementLog` registra le query delle transazioni concorrenti
-- `src/GraphDb.Server/Bolt`: server Bolt 4.4 / 5.0–5.4 (`PackStream`, `BoltValues` per la conversione dei valori, `BoltConnection` con la macchina a stati, `BoltServer`, `Transport` che riconosce TLS / Bolt / WebSocket / HTTP sulla stessa porta, `SystemQueries` per le query del database `system` usate da Neo4j Browser, `TlsCertificates`); `Program.cs` è la CLI. Accede agli internal della libreria (`InternalsVisibleTo`)
+- `src/GraphQLite.Server/Bolt`: server Bolt 4.4 / 5.0–5.4 (`PackStream`, `BoltValues` per la conversione dei valori, `BoltConnection` con la macchina a stati, `BoltServer`, `Transport` che riconosce TLS / Bolt / WebSocket / HTTP sulla stessa porta, `SystemQueries` per le query del database `system` usate da Neo4j Browser, `TlsCertificates`); `Program.cs` è la CLI. Accede agli internal della libreria (`InternalsVisibleTo`)
 
 ## Architettura (da sapere prima di toccare lo storage)
 - Un database è una **directory** con `data`, `nodes`, `rels` (pagine da 8 KB) e `wal`. `GraphDatabase.OpenInMemory()` usa segmenti di memoria nativa al posto dei file
@@ -61,7 +62,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - Server Bolt: `localhost` risolve prima a `::1`, per questo `BoltServer` ascolta anche sul loopback IPv6 (senza, ogni connessione dei driver aspetta ~2 s). L'agent di default è `Neo4j/5.26.0` perché alcuni driver decidono le funzionalità dalla versione. Gli element id sono `n:<id>` / `r:<id>`, come `elementId()`: vanno cambiati insieme
 - `QueryCursor`: una sola query aperta per transazione; iniziarne un'altra (o il commit) chiama `Detach` / `Dispose` su quella aperta. `Dispose` prima della fine ferma una lettura ma porta sempre a termine una scrittura. Un cursore di `db.Stream` possiede la sua transazione e la chiude a fine risultato
 - Neo4j Browser (fonte: sorgenti del Browser 2025.x): legge la versione da `dbms.components()` `versions[0]` (non dall'agent), interroga `SHOW DATABASES` sul db `system` (anche scritto `SYSTEM`), `dbms.showCurrentUser()` deve restituire una riga; su una pagina https accetta solo `neo4j+s` / `bolt+s` con certificato fidato; via WebSocket la risposta di 4 byte dell'handshake deve arrivare in **un solo** messaggio
-- I test con `Neo4j.Driver` importano `using Neo4j.Driver;` per `As<T>()`: i tipi omonimi (`GraphDatabase`, `Node`…) si risolvono comunque su `GraphDb` perché il namespace contenitore ha la precedenza; per i tipi del driver usare l'alias `N.`
+- I test con `Neo4j.Driver` importano `using Neo4j.Driver;` per `As<T>()`: i tipi omonimi (`GraphDatabase`, `Node`…) si risolvono comunque su `GraphQLite` perché il namespace contenitore ha la precedenza; per i tipi del driver usare l'alias `N.`
 - `Path` collide con `System.IO.Path`: il tipo dei percorsi si chiama `GraphPath`, ma il membro dell'enum resta `ValueKind.Path`
 
 ## Scelte volute (non segnalarle come problemi)
