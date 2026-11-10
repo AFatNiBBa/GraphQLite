@@ -1,3 +1,4 @@
+using GraphDb.Storage;
 namespace GraphDb.Tests;
 
 public class FeatureTests : IDisposable
@@ -178,6 +179,77 @@ public class FeatureTests : IDisposable
         var labels = Q("MATCH (n:L7) RETURN labels(n)")[0][0].AsList().Select(v => v.AsString()).Order().ToList();
         Assert.Equal(["L1", "L2", "L4", "L5", "L6", "L7"], labels);
         Assert.Empty(Q("MATCH (n:L3) RETURN n"));
+    }
+
+    [Fact]
+    public void Unique_Hash_Index_Agrees_With_A_Full_Scan()
+    {
+        Q("CREATE CONSTRAINT FOR (u:U) REQUIRE u.k IS UNIQUE");
+        // enough entries to split the buckets many times, then moves, deletions and mixed types
+        Q("UNWIND range(0, 49999) AS i CREATE (:U {k: i, s: 'u' + toString(i)})");
+        Q("MATCH (u:U) WHERE u.k % 3 = 0 SET u.k = u.k + 100000");
+        Q("MATCH (u:U) WHERE u.k % 7 = 1 DETACH DELETE u");
+        Q("UNWIND range(0, 999) AS i CREATE (:U {k: 'str' + toString(i)})");
+        Q("CREATE (:U {k: 300000.5}), (:U {k: date('2020-01-01')}), (:U {k: true})");
+
+        var expected = Q("MATCH (u:U) RETURN u.k AS k, id(u) AS id").ToDictionary(r => r["k"].ToString(), r => r.Get<long>("id"));
+        var probes = new List<object?>();
+        for (int i = 0; i < 160000; i += 1) probes.Add((long)i);
+        for (int i = 0; i < 1100; i++) probes.Add("str" + i);
+        probes.Add(300000.5);
+        probes.Add(true);
+        var found = Q("UNWIND $xs AS x MATCH (u:U {k: x}) RETURN u.k AS k, id(u) AS id", new() { ["xs"] = probes })
+            .ToDictionary(r => r["k"].ToString(), r => r.Get<long>("id"));
+        Assert.Equal(expected.Count - 1, found.Count); // the date is not among the probes
+        foreach (var (k, id) in found) Assert.Equal(expected[k], id);
+
+        // IN, numeric equality across int and float, temporal keys
+        Assert.Equal(3, Q("MATCH (u:U) WHERE u.k IN [2, 'str5', 2, 300000.5, 3] RETURN u").Count);
+        Assert.Equal(["u2"], Col<string>("MATCH (u:U {k: 2.0}) RETURN u.s"));
+        Assert.Single(Q("MATCH (u:U {k: date('2020-01-01')}) RETURN u"));
+
+        // the constraint is still enforced through the hash index
+        Assert.Throws<ConstraintViolationException>(() => Q("CREATE (:U {k: 2})"));
+        Assert.Throws<ConstraintViolationException>(() => Q("MATCH (u:U {k: 4}) SET u.k = 'str7'"));
+        Q("MATCH (u:U {k: 2}) DELETE u");
+        Q("CREATE (:U {k: 2, s: 'again'})");
+        Assert.Equal(["again"], Col<string>("MATCH (u:U {k: 2}) RETURN u.s"));
+
+        // after dropping the constraint the same queries fall back to a label scan
+        var name = Q("CALL db.constraints() YIELD name RETURN name").Single().Get<string>(0);
+        Q($"DROP CONSTRAINT {name}");
+        Assert.Equal(["again"], Col<string>("MATCH (u:U {k: 2}) RETURN u.s"));
+    }
+
+    [Fact]
+    public void Hash_Index_Handles_Collisions_Overflow_And_Frees_Its_Space()
+    {
+        var tx = _db.Store.BeginWrite();
+        long pagesAfterFirst = 0;
+        for (int round = 0; round < 2; round++)
+        {
+            long meta = HashIndex.Create(tx);
+            for (int i = 0; i < 500; i++) HashIndex.Insert(tx, meta, 42, i); // one hash: a long overflow chain
+            for (int i = 0; i < 20000; i++) HashIndex.Insert(tx, meta, (ulong)(i + 1) * 0x9E3779B97F4A7C15, 1000 + i);
+            var ids = new List<long>();
+            HashIndex.Lookup(tx, meta, 42, ids);
+            Assert.Equal(Enumerable.Range(0, 500).Select(i => (long)i), ids.Order());
+            for (int i = 0; i < 500; i += 2) HashIndex.Remove(tx, meta, 42, i);
+            HashIndex.Remove(tx, meta, 42, 100_000); // absent: no-op
+            ids.Clear();
+            HashIndex.Lookup(tx, meta, 42, ids);
+            Assert.Equal(Enumerable.Range(0, 250).Select(i => (long)(2 * i + 1)), ids.Order());
+            for (int i = 0; i < 20000; i++)
+            {
+                ids.Clear();
+                HashIndex.Lookup(tx, meta, (ulong)(i + 1) * 0x9E3779B97F4A7C15, ids);
+                Assert.Equal([1000L + i], ids);
+            }
+            HashIndex.Free(tx, meta);
+            if (round == 0) pagesAfterFirst = tx.DataPages;
+        }
+        Assert.Equal(pagesAfterFirst, tx.DataPages); // the second round reused everything the first one freed
+        tx.Abort();
     }
 
     // ------------------------------------------------------------------ subqueries

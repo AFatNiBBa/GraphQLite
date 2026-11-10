@@ -142,8 +142,10 @@ public class StorageTests : IDisposable
         db.Execute("MATCH (n) OPTIONAL MATCH (n)-[r]->(m) RETURN id(n) AS id, labels(n) AS l, properties(n) AS p, type(r) AS t, properties(r) AS rp, id(m) AS m")
             .Select(r => r.ToString()).Order(StringComparer.Ordinal).ToList();
 
-    [Fact]
-    public void Random_Workload_Survives_Repeated_Crashes()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)] // unique: B+tree plus hash index
+    public void Random_Workload_Survives_Repeated_Crashes(bool unique)
     {
         var rnd = new Random(12345);
         var opts = new DatabaseOptions { CheckpointThresholdBytes = 64 * 1024 };
@@ -158,8 +160,9 @@ public class StorageTests : IDisposable
             "MATCH (a:A)-[r:R]->() WHERE r.w = $m DELETE r",
         };
         var db = GraphDatabase.Open(DbPath, opts);
-        db.Execute("CREATE INDEX FOR (a:A) ON (a.k)");
-        reference.Execute("CREATE INDEX FOR (a:A) ON (a.k)");
+        var schema = unique ? "CREATE CONSTRAINT FOR (a:A) REQUIRE a.k IS UNIQUE" : "CREATE INDEX FOR (a:A) ON (a.k)";
+        db.Execute(schema);
+        reference.Execute(schema);
         int k = 0;
         for (int step = 0; step < 120; step++)
         {
@@ -184,6 +187,11 @@ public class StorageTests : IDisposable
             Assert.Equal(Dump(reference), Dump(db));
             Assert.Equal(reference.Execute("MATCH (a:A) WHERE a.k >= 100 AND a.k < 300 RETURN count(a)").Scalar<long>(),
                 db.Execute("MATCH (a:A) WHERE a.k >= 100 AND a.k < 300 RETURN count(a)").Scalar<long>());
+            // equality seeks (hash index when unique) agree with the reference for every key ever created
+            const string seek = "UNWIND range(0, $k) AS x OPTIONAL MATCH (a:A {k: x}) RETURN x, a.s ORDER BY x";
+            var pk = new Dictionary<string, object?> { ["k"] = k };
+            Assert.Equal(string.Join("|", reference.Execute(seek, pk).Select(r => $"{r[0]}={r[1]}")),
+                string.Join("|", db.Execute(seek, pk).Select(r => $"{r[0]}={r[1]}")));
         }
     }
 

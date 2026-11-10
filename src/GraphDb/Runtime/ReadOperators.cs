@@ -233,6 +233,9 @@ internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable,
     private sealed class C(NodeIndexSeekOp op, Cursor input, ExecContext ctx) : Cursor
     {
         private readonly Queue<(byte[] Low, byte[]? High)> _ranges = new();
+        private readonly List<long> _ids = new();
+        private int _idPos;
+        private IndexDef? _ix;
         private IndexRangeCursor? _cur;
         private LabelBitmapIterator? _fallback;
         private HashSet<long>? _seen;
@@ -248,9 +251,23 @@ internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable,
         private void Plan()
         {
             _ranges.Clear();
+            _ids.Clear();
+            _idPos = 0;
             _seen = null;
+            var tx = ctx.Store;
             switch (op.mode)
             {
+                case SeekMode.Equal when tx.IndexLookup(_ix!, op.value!(ctx), _w, _ids):
+                    break;
+                case SeekMode.In when tx.HasHashIndex(_ix!):
+                    {
+                        var v = op.value!(ctx);
+                        if (v.Kind != ValueKind.List) break;
+                        int n = 0;
+                        foreach (var x in v.ListItems) { tx.IndexLookup(_ix!, x, _w, _ids); n++; }
+                        if (n > 1) _seen = new HashSet<long>();
+                        break;
+                    }
                 case SeekMode.Equal:
                     {
                         var k = Encode(op.value!(ctx));
@@ -333,12 +350,19 @@ internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable,
                     }
                     _fallback = null;
                 }
+                while (_idPos < _ids.Count)
+                {
+                    long id = _ids[_idPos++];
+                    if (!Accept(id)) continue;
+                    ctx.Row[op.slot] = Value.FromNodeId(id);
+                    return true;
+                }
                 while (_cur != null || _ranges.Count > 0)
                 {
                     if (_cur is null)
                     {
                         var (lo, hi) = _ranges.Dequeue();
-                        _cur = tx.IndexScan(op.label.Resolve(tx), op.key.Resolve(tx), lo, hi);
+                        _cur = tx.IndexScan(_ix!, lo, hi);
                         if (_cur is null) continue;
                     }
                     while (_cur.Next(out long id))
@@ -355,7 +379,8 @@ internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable,
                 if (impossible) continue;
                 int lid = op.label.Resolve(tx), kid = op.key.Resolve(tx);
                 if (lid < 0 || kid < 0) continue;
-                if (tx.Catalog.Find(lid, kid) is null)
+                _ix = tx.Catalog.Find(lid, kid);
+                if (_ix is null)
                 {
                     // index dropped after planning: label scan, the predicate above re-checks values
                     _fallback = new LabelBitmapIterator(tx, [lid], []);

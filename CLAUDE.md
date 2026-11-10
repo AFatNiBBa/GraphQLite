@@ -22,6 +22,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
   - `Layout.cs`: `Header` (256 byte), `NodeRec` (48 byte), `RelRec` (32 byte), `AdjBlock`, helper dei blob
   - `GraphStore.cs`: `IndexDef`, `Catalog`, `GraphStore`, `StoreTx` (tutto l'accesso ai record e tutte le mutazioni)
   - `BTree.cs`: chiavi order-preserving (`IndexKeys`) e B+tree
+  - `HashIndex.cs`: indice hash (linear hashing) affiancato al B+tree degli indici unique
   - `RwLock.cs`: lock lettori/scrittore usato **solo** per l'esclusività del checkpoint
 - `src/GraphDb/Values`: `Value` (struct da 24 byte), `ValueOps` (uguaglianza, hash, ordinamento), `Temporal`, `Json`, `Entities` (`Node`, `Relationship`, `GraphPath`)
 - `src/GraphDb/Cypher`: `Lexer`, `Parser`, `Ast`, `Planner`, `ExprCompiler` (espressioni → closure)
@@ -36,6 +37,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - Scrittori serializzati da un `SemaphoreSlim` (writer gate); i lettori non vengono mai bloccati dallo scrittore, solo (brevemente) dal checkpoint
 - Recovery: replay dei frame del WAL validati da CRC32C; il replay è idempotente byte per byte, quindi corretto anche dopo un checkpoint interrotto
 - Indici: B+tree con chiavi `[tag][valore][id nodo 8 byte big-endian]`; il planner tiene **sempre** il predicato originale come filtro sopra al seek (le stringhe nelle chiavi sono troncate a 900 byte)
+- Gli indici unique hanno anche un `HashIndex` (`IndexDef.HashSlot`, flag nel catalogo; i cataloghi senza flag restano validi e usano solo il B+tree). Salva solo (hash a 64 bit, id), non i valori: i risultati sono **candidati** da verificare (filtro del planner, `FindConflict`). `HashIndex.HashOf` è persistito su disco: non va mai cambiato. Usato per `Equal`/`In` nel seek e per i controlli di unicità; range, prefissi e backfill restano sul B+tree
 - Il blob del catalogo non viene mai liberato: il suo indirizzo è univoco e fa da chiave per la cache dei piani
 
 ## Trappole (invarianti da rispettare)
@@ -60,6 +62,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - Un oggetto letterale che deve aderire ad un tipo esistente va scritto dove quel tipo è noto (tipo dichiarato, `new()` con tipo di destinazione), così l'editor suggerisce i membri
 - I TODO si scrivono come `// TODO: ...`, anche a destra della riga a cui si riferiscono
 - Le prestazioni contano: ogni modifica sul percorso caldo (lettura pagine, operatori, `Value`) va misurata con il benchmark prima e dopo
+- Sulla macchina dell'utente le misure oscillano anche di 2× tra un'esecuzione e l'altra: per un confronto si costruisce la versione committata in una `git worktree` nello scratchpad, si alternano le esecuzioni A/B più volte e si confronta il migliore di più round, non una singola esecuzione del benchmark
 
 ## Come lavorare
 - Git lo gestisce l'utente: niente commit, cambi di branch o merge se non richiesti

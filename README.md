@@ -163,6 +163,8 @@ Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 24 core):
 
 Gli indici sono **B+tree** su disco con chiavi order-preserving. Servono uguaglianza, `IN`, range (`<`, `<=`, `>`, `>=`,
 anche combinati) e `STARTS WITH`, su numeri, stringhe, booleani e temporali.
+Gli indici **unique** (i constraint) hanno in più un **indice hash** (linear hashing su bucket da 1 KB), usato per
+uguaglianza e `IN` e per verificare il vincolo: un lookup costa circa un terzo della discesa nel B+tree.
 
 **Procedure**: `db.labels`, `db.relationshipTypes`, `db.propertyKeys`, `db.indexes`, `db.constraints`, `db.stats`,
 `dbms.components`.

@@ -6,13 +6,16 @@ using System.Text;
 
 namespace GraphDb.Storage;
 
-internal sealed class IndexDef(string name, int label, int key, bool unique, int slot)
+internal sealed class IndexDef(string name, int label, int key, bool unique, int slot, int hashSlot = -1)
 {
     public readonly string Name = name;
     public readonly int Label = label;
     public readonly int Key = key;
     public readonly bool Unique = unique;
+    /// <summary>Slot of the B+tree root in the index-root vector.</summary>
     public readonly int Slot = slot;
+    /// <summary>Slot of the <see cref="HashIndex"/> meta page, or -1 (only unique indexes have one).</summary>
+    public readonly int HashSlot = hashSlot;
 }
 
 /// <summary>Immutable schema catalog (index / constraint definitions).</summary>
@@ -38,6 +41,8 @@ internal sealed class Catalog
 
     public IndexDef? ByName(string name) => Indexes.FirstOrDefault(i => i.Name == name);
 
+    private const int FlagUnique = 1, FlagHash = 2;
+
     public byte[] Encode()
     {
         var w = new BinWriter(64);
@@ -48,8 +53,9 @@ internal sealed class Catalog
             w.WriteString(ix.Name);
             w.WriteVarUInt((ulong)ix.Label);
             w.WriteVarUInt((ulong)ix.Key);
-            w.WriteByte(ix.Unique ? (byte)1 : (byte)0);
+            w.WriteByte((byte)((ix.Unique ? FlagUnique : 0) | (ix.HashSlot >= 0 ? FlagHash : 0)));
             w.WriteVarUInt((ulong)ix.Slot);
+            if (ix.HashSlot >= 0) w.WriteVarUInt((ulong)ix.HashSlot);
         }
         var bytes = w.Written.ToArray();
         BinaryPrimitives.WriteInt32LittleEndian(bytes, bytes.Length);
@@ -66,8 +72,10 @@ internal sealed class Catalog
             var name = r.ReadString();
             int label = r.ReadVarInt32();
             int key = r.ReadVarInt32();
-            bool unique = r.ReadByte() != 0;
-            list[i] = new IndexDef(name, label, key, unique, r.ReadVarInt32());
+            int flags = r.ReadByte();
+            int slot = r.ReadVarInt32();
+            int hashSlot = (flags & FlagHash) != 0 ? r.ReadVarInt32() : -1;
+            list[i] = new IndexDef(name, label, key, (flags & FlagUnique) != 0, slot, hashSlot);
         }
         return new Catalog(list);
     }
@@ -196,7 +204,7 @@ internal sealed unsafe class StoreTx
     public byte* R(long addr) => Page(Space.Data, Blobs.PageOf(addr)) + Blobs.OffsetOf(addr);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private byte* Wr(long addr) => Writer.Write(Space.Data, Blobs.PageOf(addr)) + Blobs.OffsetOf(addr);
+    internal byte* Wr(long addr) => Writer.Write(Space.Data, Blobs.PageOf(addr)) + Blobs.OffsetOf(addr);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public NodeRec* NR(long id) => (NodeRec*)(Page(Space.Nodes, id / NodeRec.PerPage) + (int)(id % NodeRec.PerPage) * NodeRec.Size);
@@ -342,6 +350,14 @@ internal sealed unsafe class StoreTx
         if (root == 0 || (ulong)i >= 1 << 20) return 0;
         long leaf = ((long*)ReadPage(root))[i >> 10];
         return leaf == 0 ? 0 : ((long*)ReadPage(leaf))[i & 1023];
+    }
+
+    /// <summary>Frees the pages of a page vector (not the pages it points to).</summary>
+    public void FreeVec(long root)
+    {
+        var leaves = new ReadOnlySpan<long>(ReadPage(root), 1024).ToArray();
+        foreach (long leaf in leaves) if (leaf != 0) FreePage(leaf);
+        FreePage(root);
     }
 
     public void VecSet(long root, long i, long value)
@@ -499,9 +515,11 @@ internal sealed unsafe class StoreTx
         if (cat.ByName(name) != null) throw new GraphDbException($"An index named '{name}' already exists");
         if (cat.Find(label, key) != null) throw new GraphDbException($"An index on :{Labels.Name(label)}({PropKeys.Name(key)}) already exists");
         int slot = HW->NextIndexSlot++;
-        var def = new IndexDef(name, label, key, unique, slot);
+        int hashSlot = unique ? HW->NextIndexSlot++ : -1;
+        var def = new IndexDef(name, label, key, unique, slot, hashSlot);
         long root = BTree.NewTree(this);
         VecSet(H->IndexRoots, slot, root);
+        if (unique) VecSet(H->IndexRoots, hashSlot, HashIndex.Create(this));
         // backfill from the label bitmap
         var w = new BinWriter(64);
         long high = NodeHigh;
@@ -538,38 +556,74 @@ internal sealed unsafe class StoreTx
         long root = IndexRoot(def);
         if (root != 0) BTree.FreeTree(this, root);
         VecSet(H->IndexRoots, def.Slot, 0);
+        if (HashMeta(def) is var meta and not 0)
+        {
+            HashIndex.Free(this, meta);
+            VecSet(H->IndexRoots, def.HashSlot, 0);
+        }
         WriteCatalog(new Catalog(cat.Indexes.Where(i => i != def).ToArray()));
         return true;
     }
 
-    private static byte[] KeyFor(in Value v, long id, BinWriter w)
+    /// <summary>Meta page of the hash index of <paramref name="ix"/>, or 0.</summary>
+    private long HashMeta(IndexDef ix) => ix.HashSlot < 0 ? 0 : VecGet(H->IndexRoots, ix.HashSlot);
+
+    public bool HasHashIndex(IndexDef ix) => HashMeta(ix) != 0;
+
+    /// <summary>Encodes the value part of an index key into <paramref name="w"/>; returns its hash (0 if not indexable).</summary>
+    private static bool EncodeKey(in Value v, BinWriter w, out ulong hash)
     {
         w.Reset();
-        if (!IndexKeys.EncodeValue(v, w)) return [];
-        IndexKeys.AppendId(w, id);
-        return w.Written.ToArray();
+        hash = 0;
+        if (!IndexKeys.EncodeValue(v, w)) return false;
+        hash = HashIndex.HashOf(w.Written);
+        return true;
     }
 
     private void IndexAdd(IndexDef ix, in Value v, long id, BinWriter w)
     {
-        var key = KeyFor(v, id, w);
-        if (key.Length == 0) return;
+        if (!EncodeKey(v, w, out ulong hash)) return;
+        IndexKeys.AppendId(w, id);
         long root = IndexRoot(ix);
-        long nr = BTree.Insert(this, root, key);
+        long nr = BTree.Insert(this, root, w.Written);
         if (nr != root) VecSet(H->IndexRoots, ix.Slot, nr);
+        if (HashMeta(ix) is var meta and not 0) HashIndex.Insert(this, meta, hash, id);
     }
 
     private void IndexRemove(IndexDef ix, in Value v, long id, BinWriter w)
     {
-        var key = KeyFor(v, id, w);
-        if (key.Length == 0) return;
-        BTree.Delete(this, IndexRoot(ix), key);
+        if (!EncodeKey(v, w, out ulong hash)) return;
+        IndexKeys.AppendId(w, id);
+        BTree.Delete(this, IndexRoot(ix), w.Written);
+        if (HashMeta(ix) is var meta and not 0) HashIndex.Remove(this, meta, hash, id);
+    }
+
+    /// <summary>
+    /// Candidate node ids for <c>n.key = v</c> through the hash index of a unique index. Returns false when
+    /// there is no such index (the caller falls back to the B+tree). Candidates must be verified by the caller.
+    /// </summary>
+    public bool IndexLookup(IndexDef ix, in Value v, BinWriter w, List<long> output)
+    {
+        long meta = HashMeta(ix);
+        if (meta == 0) return false;
+        if (EncodeKey(v, w, out ulong hash)) HashIndex.Lookup(this, meta, hash, output);
+        return true;
     }
 
     /// <summary>Returns another node holding the same value in a unique index, or null.</summary>
     private long? FindConflict(IndexDef ix, in Value v, long self)
     {
         var w = new BinWriter(64);
+        var candidates = new List<long>();
+        if (IndexLookup(ix, v, w, candidates))
+        {
+            foreach (long id in candidates)
+            {
+                if (id == self || !NodeAlive(id)) continue;
+                if (ValueOps.Equivalent(NodeProp(id, ix.Key), v)) return id;
+            }
+            return null;
+        }
         if (!IndexKeys.EncodeValue(v, w)) return null;
         var prefix = w.Written.ToArray();
         var cur = new IndexRangeCursor(this, IndexRoot(ix), prefix, IndexKeys.Successor(prefix));
@@ -593,7 +647,12 @@ internal sealed unsafe class StoreTx
     public IndexRangeCursor? IndexScan(int label, int key, ReadOnlySpan<byte> low, byte[]? high)
     {
         var ix = Catalog.Find(label, key);
-        if (ix is null) return null;
+        return ix is null ? null : IndexScan(ix, low, high);
+    }
+
+    /// <summary>Node ids matching a range [low, high) of <paramref name="ix"/>.</summary>
+    public IndexRangeCursor? IndexScan(IndexDef ix, ReadOnlySpan<byte> low, byte[]? high)
+    {
         long root = IndexRoot(ix);
         return root == 0 ? null : new IndexRangeCursor(this, root, low, high);
     }
