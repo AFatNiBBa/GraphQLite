@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="GraphDb.Tests" />
+    <InternalsVisibleTo Include="GraphDb.Server" />
   </ItemGroup>
 
 </Project>

@@ -14,6 +14,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - `dotnet test GraphDb.slnx -c Release`
 - `dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [directory]` → benchmark (senza directory: in memoria)
 - `dotnet run --project tools/GraphDb.Shell -- mydb` → REPL stile `sqlite3` (`-c "query"` per una sola query)
+- `dotnet run -c Release --project src/GraphDb.Server -- mydb [--port 7687] [--user u --password p]` → server Bolt
 - Profiling: `dotnet-trace` (tool globale, in `%USERPROFILE%\.dotnet\tools`, non sempre nel PATH: `dotnet tool install -g dotnet-trace` se manca); formato speedscope analizzabile con uno script PowerShell che somma tempo self/inclusivo per frame. Nel formato speedscope il tempo self finisce nello pseudo-frame `CPU_TIME`: va attribuito al frame sottostante. I thread worker dei `Parallel.For` non hanno i frame del chiamante nello stack
 - Il benchmark esegue le query analitiche 5 volte e tiene la migliore, ma non arrivano al tier-1 del JIT: per misure stabili su una singola query serve un harness che la ripeta per secondi
 
@@ -29,6 +30,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - `src/GraphDb/Cypher`: `Lexer`, `Parser`, `Ast`, `Planner`, `ExprCompiler` (espressioni → closure)
 - `src/GraphDb/Runtime`: operatori pull (`ReadOperators`, `WriteOperators`, `LoadCsv`), `Functions`, `Aggregation`, `Procedures`, `Core` (`ExecContext`)
 - `GraphDatabase.cs` (apertura, opzioni, cache dei piani, checkpoint), `Transaction.cs`, `QueryResult.cs`
+- `src/GraphDb.Server/Bolt`: server Bolt 4.4 / 5.0–5.4 (`PackStream`, `BoltValues` per la conversione dei valori, `BoltConnection` con la macchina a stati, `BoltServer`); `Program.cs` è la CLI. Accede agli internal della libreria (`InternalsVisibleTo`)
 
 ## Architettura (da sapere prima di toccare lo storage)
 - Un database è una **directory** con `data`, `nodes`, `rels` (pagine da 8 KB) e `wal`. `GraphDatabase.OpenInMemory()` usa segmenti di memoria nativa al posto dei file
@@ -52,6 +54,8 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - `byte*` non può essere argomento di un generico (niente `Array.Resize` su `byte*[]`)
 - Un nuovo operatore è `RowLocal` solo se ogni riga d'uscita dipende da una sola riga d'ingresso e non ha effetti collaterali (niente `Limit`, `Distinct`, `Sort`, aggregazioni, scritture, procedure): altrimenti l'aggregazione parallela darebbe risultati sbagliati. Gli operatori e le closure dei piani devono restare thread-safe (sono già condivisi tra query dalla cache dei piani)
 - Gli aggregatori nuovi devono implementare `Merge`; `DistinctAgg.Merge` si appoggia all'ordine di inserimento di `HashSet` (vale finché non si rimuovono elementi)
+- Server Bolt: `localhost` risolve prima a `::1`, per questo `BoltServer` ascolta anche sul loopback IPv6 (senza, ogni connessione dei driver aspetta ~2 s). L'agent di default è `Neo4j/5.26.0` perché alcuni driver decidono le funzionalità dalla versione. Gli element id sono `n:<id>` / `r:<id>`, come `elementId()`: vanno cambiati insieme
+- I test con `Neo4j.Driver` importano `using Neo4j.Driver;` per `As<T>()`: i tipi omonimi (`GraphDatabase`, `Node`…) si risolvono comunque su `GraphDb` perché il namespace contenitore ha la precedenza; per i tipi del driver usare l'alias `N.`
 - `Path` collide con `System.IO.Path`: il tipo dei percorsi si chiama `GraphPath`, ma il membro dell'enum resta `ValueKind.Path`
 
 ## Scelte volute (non segnalarle come problemi)

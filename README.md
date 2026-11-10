@@ -34,7 +34,8 @@ using (var tx = db.BeginTransaction())                     // transazione esplic
 | Percorso | Contenuto |
 |---|---|
 | `src/GraphDb` | la libreria |
-| `tests/GraphDb.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità |
+| `src/GraphDb.Server` | server **Bolt** (`bolt://` / `neo4j://`) da avviare su una directory del database |
+| `tests/GraphDb.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità, server Bolt con il driver ufficiale Neo4j |
 | `tools/GraphDb.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphDb.Shell -- mydb`) |
 | `tools/GraphDb.Bench` | benchmark (`dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [directory]`) |
 
@@ -42,6 +43,9 @@ using (var tx = db.BeginTransaction())                     // transazione esplic
 dotnet build GraphDb.slnx
 dotnet test  GraphDb.slnx
 ```
+
+I test del server usano il pacchetto `Neo4j.Driver` (solo nel progetto di test: la libreria e il server non hanno
+dipendenze esterne).
 
 ## Storage (grafo più grande della RAM)
 
@@ -87,6 +91,46 @@ Un database è una **directory**:
   transazione resta utilizzabile.
 - `CALL { … } IN TRANSACTIONS OF n ROWS` committa a lotti, così si importano dataset enormi senza tenere tutto in memoria.
 
+## Server (Bolt)
+
+`GraphDb.Server` espone una directory del database con il protocollo **Bolt**, lo stesso di Neo4j: i driver ufficiali
+(.NET, Java, Python, JavaScript, Go…) e gli strumenti che li usano si collegano con `bolt://` o `neo4j://` senza
+modifiche, quindi si può passare da Neo4j a GraphDb (e viceversa) cambiando solo l'indirizzo.
+
+```
+dotnet run -c Release --project src/GraphDb.Server -- mydb
+dotnet run -c Release --project src/GraphDb.Server -- mydb --host 0.0.0.0 --port 7687 --user neo4j --password secret
+```
+
+| Opzione | Significato |
+|---|---|
+| `--host` | indirizzo di ascolto (default `127.0.0.1`; `0.0.0.0` per tutte le interfacce) |
+| `--port` | porta (default 7687) |
+| `--user` / `--password` | autenticazione basic obbligatoria (default: nessuna autenticazione) |
+| `--database` | nome del database esposto (default `neo4j`) |
+| `--advertised` | indirizzo restituito nelle tabelle di routing di `neo4j://` |
+| `--sync` | `off` / `normal` / `full` (vedi `SyncMode`) |
+
+Il server si può anche incorporare in un'applicazione: `new BoltServer(db, new BoltServerOptions { ... }).Start()`.
+
+Cosa supporta:
+- Bolt **4.4** e **5.0–5.4**: autenticazione (`HELLO` / `LOGON` / `LOGOFF`), query in auto-commit, transazioni esplicite
+  (`BEGIN` / `COMMIT` / `ROLLBACK`, anche le transazioni gestite `ExecuteRead` / `ExecuteWrite` dei driver), streaming
+  a blocchi (`PULL` con fetch size), `RESET`, access mode di lettura (le scritture vengono rifiutate);
+- `neo4j://`: il server risponde a `ROUTE` indicando sé stesso come writer, reader e router;
+- tutti i tipi: nodi, relazioni e path (con element id `n:<id>` / `r:<id>`, gli stessi di `elementId()`), liste e mappe
+  annidate, tipi temporali, durate e punti, sia nei risultati sia nei parametri;
+- errori con i codici di Neo4j (`Neo.ClientError.Statement.SyntaxError`, `…Schema.ConstraintValidationFailed`, …),
+  quindi la logica di retry dei driver funziona come con Neo4j.
+
+Limiti del server:
+- niente TLS (`bolt+s://`, `neo4j+s://`) e niente WebSocket: Neo4j Browser non si collega, i driver sì;
+- un solo database per processo; `SHOW DATABASES` e il database `system` non esistono;
+- i risultati vengono materializzati prima dello streaming, quindi una query che restituisce milioni di righe le tiene
+  in memoria;
+- come nella libreria, le transazioni di scrittura sono serializzate: una transazione esplicita di scrittura lasciata
+  aperta da un client blocca gli altri scrittori finché non termina.
+
 ## Prestazioni
 
 Le tecniche principali:
@@ -105,7 +149,7 @@ Le tecniche principali:
 
 Con le query parallele conviene il **Server GC** (`<ServerGarbageCollection>true</ServerGarbageCollection>` nel
 progetto dell'applicazione): le aggregazioni con molti gruppi allocano da più thread e con il GC workstation vanno
-circa a metà velocità. Il benchmark lo usa già.
+circa a metà velocità. Il benchmark e il server lo usano già.
 
 Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 16 core; le misure oscillano tra un'esecuzione
 e l'altra):
@@ -122,6 +166,10 @@ e l'altra):
 | `shortestPath` (≤ 6 hop) | ~13 k query/s | ~14 k query/s |
 | bulk insert relazioni (`UNWIND` + 2 index seek) | ~470 k/s | ~250 k/s |
 | update in transazioni da un singolo statement | ~140 k/s | ~60 k/s |
+
+Attraverso il server Bolt, con il driver ufficiale .NET sulla stessa macchina: ~14 k query/s con un client e
+~115 k query/s con 32 client (lookup e 2-hop). Il limite è il costo del protocollo e del driver: durante la misura il
+server usa circa il 10% della CPU.
 
 ## openCypher supportato
 
@@ -194,7 +242,7 @@ dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
 
 - **Un solo processo** per database: la directory è aperta in esclusiva. Più processi richiederebbero un indice delle
   versioni in shared memory e lock tra processi (come il file `-shm` di SQLite). Si può aggiungere, ma è un pezzo
-  di architettura a sé.
+  di architettura a sé. Per condividere un database tra più processi o macchine si usa `GraphDb.Server`.
 - Le query parallele riguardano solo le aggregazioni sopra una scansione di nodi: le query che restituiscono molte righe
   senza aggregare, e le transazioni di scrittura, restano su un solo thread.
 - Le date sono limitate agli anni 1–9999 e la precisione temporale è di 100 ns (tick .NET).

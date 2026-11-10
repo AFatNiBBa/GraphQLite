@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/GraphDb/GraphDb.csproj" />
+    <Project Path="src/GraphDb.Server/GraphDb.Server.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/GraphDb.Tests/GraphDb.Tests.csproj" />
