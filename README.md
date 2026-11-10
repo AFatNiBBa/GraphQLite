@@ -95,20 +95,33 @@ Le tecniche principali:
 - operatori pull che scrivono in-place su un'unica riga;
 - planner cost-based (index seek per uguaglianza/IN/range/prefisso, seek per `id()`, scan della label più piccola,
   `ExpandInto` sui cicli, Top-N con heap, `shortestPath` con BFS bidirezionale);
+- **aggregazioni parallele**: un'aggregazione sopra una scansione di nodi grande (≥ 16k righe per thread) divide lo
+  spazio degli id in intervalli, li aggrega su più thread e unisce i risultati nell'ordine degli intervalli, quindi il
+  risultato è identico a quello sequenziale (a parte l'arrotondamento delle somme di float). Vale per le transazioni di
+  sola lettura; `DatabaseOptions.MaxDegreeOfParallelism` (default: numero di core, `1` la disattiva);
 - cache dei piani lock-free;
-- lookup delle pagine con tabelle sparse lock-free (due accessi ad array).
+- lookup delle pagine con tabelle sparse lock-free (due accessi ad array);
+- pool delle pagine da 8 KB: la copy-on-write non passa dall'heap nativo a ogni pagina toccata.
 
-Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 24 core):
+Con le query parallele conviene il **Server GC** (`<ServerGarbageCollection>true</ServerGarbageCollection>` nel
+progetto dell'applicazione): le aggregazioni con molti gruppi allocano da più thread e con il GC workstation vanno
+circa a metà velocità. Il benchmark lo usa già.
 
-| Operazione | In memoria |
-|---|---|
-| lookup su indice unique, 1 thread | ~0,8 M query/s |
-| lookup su indice unique, 24 thread | ~6 M query/s |
-| 2-hop friends-of-friends, 24 thread | ~1,3 M query/s |
-| scan per label + filtro | ~11 M righe/s |
-| espansione di tutte le relazioni + filtro su proprietà | ~10 M relazioni/s |
-| `shortestPath` (≤ 6 hop) | ~12 k query/s |
-| bulk insert relazioni (`UNWIND` + 2 index seek) | ~120 k/s (su disco ~70 k/s) |
+Risultati indicativi (`tools/GraphDb.Bench`, 200k nodi / 1M relazioni, 16 core; le misure oscillano tra un'esecuzione
+e l'altra):
+
+| Operazione | In memoria | Su disco |
+|---|---|---|
+| lookup su indice unique, 1 thread | ~1,1 M query/s | ~1,1 M query/s |
+| lookup su indice unique, 16 thread | ~11 M query/s | ~11 M query/s |
+| 2-hop friends-of-friends, 1 thread | ~120 k query/s | ~120 k query/s |
+| 2-hop friends-of-friends, 16 thread | ~1,2–2 M query/s | ~1,2 M query/s |
+| scan per label + filtro / group by | ~50–60 M righe/s | ~55–60 M righe/s |
+| espansione di tutte le relazioni + filtro su proprietà | ~90 M relazioni/s | ~90 M relazioni/s |
+| grado entrante + top-5 (200k gruppi) | ~13 M relazioni/s | ~15 M relazioni/s |
+| `shortestPath` (≤ 6 hop) | ~13 k query/s | ~14 k query/s |
+| bulk insert relazioni (`UNWIND` + 2 index seek) | ~470 k/s | ~250 k/s |
+| update in transazioni da un singolo statement | ~140 k/s | ~60 k/s |
 
 ## openCypher supportato
 
@@ -182,6 +195,8 @@ dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
 - **Un solo processo** per database: la directory è aperta in esclusiva. Più processi richiederebbero un indice delle
   versioni in shared memory e lock tra processi (come il file `-shm` di SQLite). Si può aggiungere, ma è un pezzo
   di architettura a sé.
+- Le query parallele riguardano solo le aggregazioni sopra una scansione di nodi: le query che restituiscono molte righe
+  senza aggregare, e le transazioni di scrittura, restano su un solo thread.
 - Le date sono limitate agli anni 1–9999 e la precisione temporale è di 100 ns (tick .NET).
 - Gli indici coprono una sola proprietà (niente indici compositi o full-text).
 - Una transazione di scrittura tiene in memoria le pagine che modifica: per import molto grandi usare

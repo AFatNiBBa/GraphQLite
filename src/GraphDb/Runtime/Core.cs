@@ -66,6 +66,10 @@ internal sealed class ExecContext
     public Action? CommitBatch;
     private int _tick;
 
+    /// <summary>Scan restricted to a node id range (parallel aggregation workers), see <see cref="PartitionOf"/>.</summary>
+    private Operator? _partitionLeaf;
+    private long _partitionLow, _partitionHigh;
+
     public ExecContext(StoreTx store, int slots, Value[] parameters, DatabaseOptions options, CancellationToken ct)
     {
         Store = store;
@@ -74,6 +78,24 @@ internal sealed class ExecContext
         Options = options;
         Cancellation = ct;
     }
+
+    /// <summary>Context of a parallel worker: same snapshot and parameters, private row, scan of <paramref name="leaf"/> restricted to [low, high).</summary>
+    public ExecContext ForPartition(Operator leaf, long low, long high)
+    {
+        var w = new ExecContext(Store, Row.Length, Params, Options, Cancellation)
+        {
+            _partitionLeaf = leaf,
+            _partitionLow = low,
+            _partitionHigh = high,
+        };
+        Row.AsSpan().CopyTo(w.Row);
+        return w;
+    }
+
+    /// <summary>Node id range that the scan <paramref name="scan"/> must cover in this context.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public (long Low, long High) PartitionOf(Operator scan) =>
+        ReferenceEquals(scan, _partitionLeaf) ? (_partitionLow, _partitionHigh) : (0, long.MaxValue);
 
     /// <summary>Verifies that deleted nodes have no remaining relationships (deferred DELETE check).</summary>
     public void CheckPendingDeletes()
@@ -109,6 +131,12 @@ internal abstract class Operator
     public virtual string Details => "";
     public virtual IEnumerable<Operator> Children => [];
 
+    /// <summary>
+    /// True when every output row depends only on one input row and the operator has no side effects, so its
+    /// input can be split into partitions processed independently (parallel aggregation).
+    /// </summary>
+    public virtual bool RowLocal => false;
+
     public void Explain(StringBuilder sb, int depth)
     {
         sb.Append(' ', depth * 2).Append("+").Append(Name);
@@ -124,6 +152,13 @@ internal abstract class UnaryOperator(Operator input) : Operator
 {
     public readonly Operator Input = input;
     public override IEnumerable<Operator> Children => [Input];
+}
+
+/// <summary>A node scan whose id space can be split into ranges (<see cref="ExecContext.PartitionOf"/>).</summary>
+internal interface IPartitionedScan
+{
+    /// <summary>Estimated number of rows produced for one input row.</summary>
+    long EstimateRows(StoreTx tx);
 }
 
 /// <summary>Produces exactly one (current) row. Used as the leaf of every pipeline and nested plan.</summary>

@@ -34,13 +34,16 @@ internal static class LabelUtil
 
 // ====================================================================== scans
 
-internal sealed unsafe class AllNodesScanOp(Operator input, int slot, string variable) : UnaryOperator(input)
+internal sealed unsafe class AllNodesScanOp(Operator input, int slot, string variable) : UnaryOperator(input), IPartitionedScan
 {
     public override string Name => "AllNodesScan";
+    public override bool RowLocal => true;
     public override string Details => variable;
-    public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slot);
+    public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx, slot);
 
-    private sealed class C(Cursor input, ExecContext ctx, int slot) : Cursor
+    public long EstimateRows(StoreTx tx) => tx.NodeCount;
+
+    private sealed class C(AllNodesScanOp op, Cursor input, ExecContext ctx, int slot) : Cursor
     {
         private long _i, _high;
         private bool _active;
@@ -53,8 +56,9 @@ internal sealed unsafe class AllNodesScanOp(Operator input, int slot, string var
                 if (!_active)
                 {
                     if (!input.Next()) return false;
-                    _i = 0;
-                    _high = tx.NodeHigh;
+                    var (low, high) = ctx.PartitionOf(op);
+                    _i = low;
+                    _high = Math.Min(high, tx.NodeHigh);
                     _active = true;
                 }
                 while (_i < _high)
@@ -83,15 +87,21 @@ internal sealed unsafe class LabelBitmapIterator
     private readonly long[] _allDirs, _anyDirs;
     private readonly long[] _allPages, _anyPages;
     private readonly long _high;
-    private long _group = -1;
+    private long _group;
     private int _word = 1024;
     private ulong _bits;
     private readonly bool _empty;
+    private readonly long _firstGroup;
+    private readonly int _firstWord;
 
-    public LabelBitmapIterator(StoreTx tx, int[] all, int[] any)
+    /// <summary>Iterates the node ids in [<paramref name="low"/>, <paramref name="high"/>); <paramref name="low"/> must be a multiple of 64.</summary>
+    public LabelBitmapIterator(StoreTx tx, int[] all, int[] any, long low = 0, long high = long.MaxValue)
     {
         _tx = tx;
-        _high = tx.NodeHigh;
+        _high = Math.Min(high, tx.NodeHigh);
+        _firstGroup = low >> 16;
+        _firstWord = (int)((low & 65535) >> 6);
+        _group = _firstGroup - 1;
         _allDirs = all.Select(tx.LabelDir).ToArray();
         _anyDirs = any.Select(tx.LabelDir).ToArray();
         _allPages = new long[_allDirs.Length];
@@ -118,7 +128,7 @@ internal sealed unsafe class LabelBitmapIterator
             }
             if (ok && anyOk)
             {
-                _word = 0;
+                _word = _group == _firstGroup ? _firstWord : 0;
                 return true;
             }
         }
@@ -163,11 +173,20 @@ internal sealed unsafe class LabelBitmapIterator
 }
 
 /// <summary>Label scan: nodes having all labels of <c>all</c> and at least one of <c>any</c>.</summary>
-internal sealed class LabelScanOp(Operator input, int slot, string variable, TokenRef[] all, TokenRef[] any) : UnaryOperator(input)
+internal sealed class LabelScanOp(Operator input, int slot, string variable, TokenRef[] all, TokenRef[] any) : UnaryOperator(input), IPartitionedScan
 {
     public override string Name => "NodeByLabelScan";
+    public override bool RowLocal => true;
     public override string Details => variable + LabelUtil.Format(all) + (any.Length > 0 ? ":(" + string.Join("|", any.Select(a => a.Name)) + ")" : "");
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
+
+    public long EstimateRows(StoreTx tx)
+    {
+        long n = all.Length == 0 ? 0 : long.MaxValue;
+        foreach (var t in all) n = Math.Min(n, t.Resolve(tx) is var id and >= 0 ? tx.LabelCount(id) : 0);
+        foreach (var t in any) n += t.Resolve(tx) is var id and >= 0 ? tx.LabelCount(id) : 0;
+        return n;
+    }
 
     private sealed class C(LabelScanOp op, Cursor input, ExecContext ctx) : Cursor
     {
@@ -189,7 +208,8 @@ internal sealed class LabelScanOp(Operator input, int slot, string variable, Tok
                 if (impossible) { _it = null; continue; }
                 var any = op.any.Select(t => t.Resolve(ctx.Store)).Where(x => x >= 0).ToArray();
                 if (op.any.Length > 0 && any.Length == 0) { _it = null; continue; }
-                _it = new LabelBitmapIterator(ctx.Store, all, any);
+                var (low, high) = ctx.PartitionOf(op);
+                _it = new LabelBitmapIterator(ctx.Store, all, any, low, high);
             }
         }
     }
@@ -219,6 +239,7 @@ internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable,
     private readonly Eval? high = high;
     private readonly bool highInclusive = highInclusive;
 
+    public override bool RowLocal => true;
     public override string Name => mode switch
     {
         SeekMode.In => "NodeIndexSeek(IN)",
@@ -395,6 +416,7 @@ internal sealed class NodeIndexSeekOp(Operator input, int slot, string variable,
 internal sealed class NodeByIdSeekOp(Operator input, int slot, string variable, Eval ids) : UnaryOperator(input)
 {
     public override string Name => "NodeByIdSeek";
+    public override bool RowLocal => true;
     public override string Details => variable;
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slot, ids);
 
@@ -524,6 +546,7 @@ internal sealed class ExpandOp(Operator input, int fromSlot, int relSlot, int to
     private readonly int[] uniqueSlots = uniqueSlots;
 
     public override string Name => into ? "ExpandInto" : "Expand";
+    public override bool RowLocal => true;
     public override string Details => desc;
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
@@ -618,6 +641,7 @@ internal sealed class VarExpandOp(Operator input, int fromSlot, int relSlot, int
     private readonly bool reverse = reverse;
 
     public override string Name => into ? "VarLengthExpandInto" : "VarLengthExpand";
+    public override bool RowLocal => true;
     public override string Details => desc;
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
@@ -777,6 +801,7 @@ internal sealed class ShortestPathOp(Operator input, int fromSlot, int toSlot, i
     private readonly bool all = all;
 
     public override string Name => all ? "AllShortestPaths" : "ShortestPath";
+    public override bool RowLocal => true;
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
     private sealed class C(ShortestPathOp op, Cursor input, ExecContext ctx) : Cursor
@@ -972,6 +997,7 @@ internal sealed class BuildPathOp(Operator input, int pathSlot, int[] nodeSlots,
     private readonly int[] relSlots = relSlots;
 
     public override string Name => "ProjectPath";
+    public override bool RowLocal => true;
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
     public static Value Build(ExecContext ctx, int[] nodeSlots, int[] relSlots)
@@ -1021,6 +1047,7 @@ internal sealed class BuildPathOp(Operator input, int pathSlot, int[] nodeSlots,
 internal sealed class FilterOp(Operator input, Eval predicate, string text) : UnaryOperator(input)
 {
     public override string Name => "Filter";
+    public override bool RowLocal => true;
     public override string Details => text;
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, predicate);
 
@@ -1041,6 +1068,7 @@ internal sealed class FilterOp(Operator input, Eval predicate, string text) : Un
 internal sealed class ProjectionOp(Operator input, int[] slots, Eval[] evals, string desc) : UnaryOperator(input)
 {
     public override string Name => "Projection";
+    public override bool RowLocal => true;
     public override string Details => desc;
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slots, evals);
 
@@ -1059,6 +1087,7 @@ internal sealed class ProjectionOp(Operator input, int[] slots, Eval[] evals, st
 internal sealed class UnwindOp(Operator input, Eval list, int slot) : UnaryOperator(input)
 {
     public override string Name => "Unwind";
+    public override bool RowLocal => true;
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, list, slot);
 
     private sealed class C(Cursor input, ExecContext ctx, Eval list, int slot) : Cursor
@@ -1092,6 +1121,7 @@ internal sealed class UnwindOp(Operator input, Eval list, int slot) : UnaryOpera
 internal sealed class OptionalOp(Operator input, Operator inner, int[] nullSlots) : UnaryOperator(input)
 {
     public override string Name => "Optional";
+    public override bool RowLocal => true;
     public override IEnumerable<Operator> Children => [Input, inner];
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, inner, nullSlots);
 
@@ -1135,6 +1165,7 @@ internal sealed class ApplyOp(Operator input, Operator inner, bool unit, Eval? b
     private readonly Eval? batchSize = batchSize;
 
     public override string Name => batchSize is null ? "Apply" : "TransactionApply";
+    public override bool RowLocal => batchSize is null;
     public override IEnumerable<Operator> Children => [Input, inner];
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 

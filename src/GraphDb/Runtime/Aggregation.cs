@@ -4,6 +4,9 @@ internal abstract class Aggregator
 {
     public abstract void Add(in Value v);
     public abstract Value Result();
+
+    /// <summary>Adds the state of <paramref name="other"/> (same kind), as if its inputs had been added after ours.</summary>
+    public abstract void Merge(Aggregator other);
 }
 
 internal enum AggKind { Count, CountStar, Sum, Avg, Min, Max, Collect, StDev, StDevP, PercentileCont, PercentileDisc }
@@ -56,6 +59,7 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
         private long _n;
         public override void Add(in Value v) { if (!v.IsNull) _n++; }
         public override Value Result() => Value.FromInt(_n);
+        public override void Merge(Aggregator other) => _n += ((CountAgg)other)._n;
     }
 
     private sealed class SumAgg : Aggregator
@@ -86,6 +90,19 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
         }
 
         public override Value Result() => _float ? Value.FromFloat(_d) : Value.FromInt(_l);
+
+        public override void Merge(Aggregator other)
+        {
+            var o = (SumAgg)other;
+            if (_float || o._float)
+            {
+                _d = (_float ? _d : _l) + (o._float ? o._d : o._l);
+                _float = true;
+                return;
+            }
+            try { _l = checked(_l + o._l); }
+            catch (OverflowException) { throw new CypherRuntimeException("Integer overflow in sum()"); }
+        }
     }
 
     private sealed class AvgAgg : Aggregator
@@ -102,6 +119,13 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
         }
 
         public override Value Result() => _n == 0 ? Value.Null : Value.FromFloat(_sum / _n);
+
+        public override void Merge(Aggregator other)
+        {
+            var o = (AvgAgg)other;
+            _sum += o._sum;
+            _n += o._n;
+        }
     }
 
     private sealed class MinMaxAgg(bool max) : Aggregator
@@ -118,6 +142,12 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
         }
 
         public override Value Result() => _has ? _best : Value.Null;
+
+        public override void Merge(Aggregator other)
+        {
+            var o = (MinMaxAgg)other;
+            if (o._has) Add(o._best);
+        }
     }
 
     private sealed class CollectAgg : Aggregator
@@ -125,6 +155,7 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
         private readonly List<Value> _items = new();
         public override void Add(in Value v) { if (!v.IsNull) _items.Add(v); }
         public override Value Result() => Value.FromList(_items.ToArray());
+        public override void Merge(Aggregator other) => _items.AddRange(((CollectAgg)other)._items);
     }
 
     private sealed class StDevAgg(bool sample) : Aggregator
@@ -147,6 +178,23 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
             if (_n == 0) return Value.FromFloat(0);
             if (sample) return Value.FromFloat(_n < 2 ? 0 : Math.Sqrt(_m2 / (_n - 1)));
             return Value.FromFloat(Math.Sqrt(_m2 / _n));
+        }
+
+        public override void Merge(Aggregator other)
+        {
+            // Chan et al. parallel variance
+            var o = (StDevAgg)other;
+            if (o._n == 0) return;
+            if (_n == 0)
+            {
+                (_n, _mean, _m2) = (o._n, o._mean, o._m2);
+                return;
+            }
+            long n = _n + o._n;
+            double d = o._mean - _mean;
+            _mean += d * o._n / n;
+            _m2 += o._m2 + d * d * ((double)_n * o._n / n);
+            _n = n;
         }
     }
 
@@ -178,6 +226,13 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
             int k = pc == 0 ? 0 : (int)Math.Ceiling(pc * idx.Length) - 1;
             return _raw[idx[Math.Clamp(k, 0, idx.Length - 1)]];
         }
+
+        public override void Merge(Aggregator other)
+        {
+            var o = (PercentileAgg)other;
+            _vals.AddRange(o._vals);
+            _raw.AddRange(o._raw);
+        }
     }
 
     private sealed class DistinctAgg(Aggregator inner) : Aggregator
@@ -191,6 +246,13 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
         }
 
         public override Value Result() => inner.Result();
+
+        // the other side's inner state may count values we already have: replay its distinct values instead.
+        // A HashSet without removals enumerates in insertion order, so collect(DISTINCT) keeps its order.
+        public override void Merge(Aggregator other)
+        {
+            foreach (var v in ((DistinctAgg)other)._seen) Add(v);
+        }
     }
 }
 
@@ -211,58 +273,149 @@ internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEval
         public readonly Aggregator[] Aggs = aggs;
     }
 
+    /// <summary>
+    /// Scan at the bottom of the input when the input is a chain of row-local operators: its id space can then
+    /// be split into ranges aggregated in parallel and merged.
+    /// </summary>
+    private readonly Operator? _parallelLeaf = FindParallelLeaf(input);
+
+    /// <summary>Minimum estimated input rows per worker for a parallel aggregation.</summary>
+    internal const long ParallelRowsPerWorker = 16_384;
+
+    private static Operator? FindParallelLeaf(Operator op)
+    {
+        while (op.RowLocal && op is UnaryOperator u)
+        {
+            if (op is IPartitionedScan && u.Input is StartOp) return op;
+            op = u.Input;
+        }
+        return null;
+    }
+
+    /// <summary>Groups computed over (a part of) the input, in order of first appearance.</summary>
+    private sealed class Partial
+    {
+        public readonly List<(Value[] Key, Group G)> Order = new();
+        public Dictionary<Value[], Group>? Groups;
+        public Group? Single;
+    }
+
+    private Aggregator[] NewAggs(ExecContext ctx)
+    {
+        var a = new Aggregator[aggs.Length];
+        for (int i = 0; i < a.Length; i++) a[i] = aggs[i].Create(ctx);
+        return a;
+    }
+
+    private void Feed(Group g, ExecContext ctx)
+    {
+        for (int i = 0; i < aggs.Length; i++)
+        {
+            var spec = aggs[i];
+            g.Aggs[i].Add(spec.Kind == AggKind.CountStar ? Value.True : spec.Arg!(ctx));
+        }
+    }
+
+    private Partial Aggregate(Cursor input, ExecContext ctx)
+    {
+        var part = new Partial();
+        int nk = keyEvals.Length;
+        if (nk == 0)
+        {
+            while (input.Next())
+            {
+                part.Single ??= new Group(RowOps.Snapshot(ctx.Row), NewAggs(ctx));
+                Feed(part.Single, ctx);
+            }
+            return part;
+        }
+        var groups = part.Groups = new Dictionary<Value[], Group>(ValueEquivalenceComparer.Instance);
+        var probe = new Value[nk];
+        while (input.Next())
+        {
+            for (int i = 0; i < nk; i++) probe[i] = keyEvals[i](ctx);
+            if (!groups.TryGetValue(probe, out var g))
+            {
+                var key = (Value[])probe.Clone();
+                g = new Group(RowOps.Snapshot(ctx.Row), NewAggs(ctx));
+                groups[key] = g;
+                part.Order.Add((key, g));
+            }
+            Feed(g, ctx);
+        }
+        return part;
+    }
+
+    /// <summary>Number of workers worth using for this execution (1 = sequential).</summary>
+    private int Workers(ExecContext ctx)
+    {
+        if (_parallelLeaf is null || ctx.Store.IsWriter) return 1;
+        int max = ctx.Options.MaxDegreeOfParallelism;
+        if (max <= 1) return 1;
+        long rows = ((IPartitionedScan)_parallelLeaf).EstimateRows(ctx.Store);
+        return (int)Math.Min(max, rows / ParallelRowsPerWorker);
+    }
+
+    /// <summary>
+    /// Aggregates contiguous node id ranges in parallel and merges them in range order, so groups, first-row
+    /// snapshots and collect() order are the same as in a sequential run.
+    /// </summary>
+    private Partial AggregateParallel(ExecContext ctx, int workers)
+    {
+        long high = ctx.Store.NodeHigh;
+        long size = Math.Max(4096, ((high + workers * 8 - 1) / (workers * 8) + 63) & ~63L);
+        int chunks = (int)((high + size - 1) / size);
+        var parts = new Partial[chunks];
+        var leaf = _parallelLeaf!;
+        try
+        {
+            Parallel.For(0, chunks, new ParallelOptions { MaxDegreeOfParallelism = workers }, i =>
+            {
+                var w = ctx.ForPartition(leaf, i * size, (i + 1) * size);
+                parts[i] = Aggregate(Input.Open(w), w);
+            });
+        }
+        catch (AggregateException ae)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+        }
+        var result = new Partial { Groups = keyEvals.Length == 0 ? null : new Dictionary<Value[], Group>(ValueEquivalenceComparer.Instance) };
+        foreach (var p in parts)
+        {
+            if (p.Single != null)
+            {
+                if (result.Single is null) result.Single = p.Single;
+                else MergeInto(result.Single, p.Single);
+            }
+            foreach (var (key, g) in p.Order)
+            {
+                if (result.Groups!.TryGetValue(key, out var existing)) MergeInto(existing, g);
+                else
+                {
+                    result.Groups[key] = g;
+                    result.Order.Add((key, g));
+                }
+            }
+        }
+        return result;
+    }
+
+    private static void MergeInto(Group target, Group source)
+    {
+        for (int i = 0; i < target.Aggs.Length; i++) target.Aggs[i].Merge(source.Aggs[i]);
+    }
+
     private sealed class C(AggregateOp op, Cursor input, ExecContext ctx) : Cursor
     {
         private List<(Value[] Key, Group G)>? _out;
         private int _pos;
 
-        private Aggregator[] NewAggs()
-        {
-            var a = new Aggregator[op.aggs.Length];
-            for (int i = 0; i < a.Length; i++) a[i] = op.aggs[i].Create(ctx);
-            return a;
-        }
-
-        private void Feed(Group g)
-        {
-            var aggs = op.aggs;
-            for (int i = 0; i < aggs.Length; i++)
-            {
-                var spec = aggs[i];
-                g.Aggs[i].Add(spec.Kind == AggKind.CountStar ? Value.True : spec.Arg!(ctx));
-            }
-        }
-
         private void Run()
         {
-            _out = new List<(Value[], Group)>();
-            int nk = op.keyEvals.Length;
-            if (nk == 0)
-            {
-                Group? single = null;
-                while (input.Next())
-                {
-                    single ??= new Group(RowOps.Snapshot(ctx.Row), NewAggs());
-                    Feed(single);
-                }
-                single ??= new Group(null!, NewAggs());
-                _out.Add(([], single));
-                return;
-            }
-            var groups = new Dictionary<Value[], Group>(ValueEquivalenceComparer.Instance);
-            var probe = new Value[nk];
-            while (input.Next())
-            {
-                for (int i = 0; i < nk; i++) probe[i] = op.keyEvals[i](ctx);
-                if (!groups.TryGetValue(probe, out var g))
-                {
-                    var key = (Value[])probe.Clone();
-                    g = new Group(RowOps.Snapshot(ctx.Row), NewAggs());
-                    groups[key] = g;
-                    _out.Add((key, g));
-                }
-                Feed(g);
-            }
+            int workers = op.Workers(ctx);
+            var part = workers > 1 ? op.AggregateParallel(ctx, workers) : op.Aggregate(input, ctx);
+            _out = part.Order;
+            if (op.keyEvals.Length == 0) _out.Add(([], part.Single ?? new Group(null!, op.NewAggs(ctx))));
         }
 
         public override bool Next()

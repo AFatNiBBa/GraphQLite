@@ -14,7 +14,8 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - `dotnet test GraphDb.slnx -c Release`
 - `dotnet run -c Release --project tools/GraphDb.Bench -- 200000 5 [directory]` → benchmark (senza directory: in memoria)
 - `dotnet run --project tools/GraphDb.Shell -- mydb` → REPL stile `sqlite3` (`-c "query"` per una sola query)
-- Profiling: `dotnet-trace` è installato come tool globale; formato speedscope analizzabile con uno script PowerShell che somma tempo self/inclusivo per frame
+- Profiling: `dotnet-trace` (tool globale, in `%USERPROFILE%\.dotnet\tools`, non sempre nel PATH: `dotnet tool install -g dotnet-trace` se manca); formato speedscope analizzabile con uno script PowerShell che somma tempo self/inclusivo per frame. Nel formato speedscope il tempo self finisce nello pseudo-frame `CPU_TIME`: va attribuito al frame sottostante. I thread worker dei `Parallel.For` non hanno i frame del chiamante nello stack
+- Il benchmark esegue le query analitiche 5 volte e tiene la migliore, ma non arrivano al tier-1 del JIT: per misure stabili su una singola query serve un harness che la ripeta per secondi
 
 ## Struttura
 - `src/GraphDb/Storage`:
@@ -39,6 +40,8 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - Indici: B+tree con chiavi `[tag][valore][id nodo 8 byte big-endian]`; il planner tiene **sempre** il predicato originale come filtro sopra al seek (le stringhe nelle chiavi sono troncate a 900 byte)
 - Gli indici unique hanno anche un `HashIndex` (`IndexDef.HashSlot`, flag nel catalogo; i cataloghi senza flag restano validi e usano solo il B+tree). Salva solo (hash a 64 bit, id), non i valori: i risultati sono **candidati** da verificare (filtro del planner, `FindConflict`). `HashIndex.HashOf` è persistito su disco: non va mai cambiato. Usato per `Equal`/`In` nel seek e per i controlli di unicità; range, prefissi e backfill restano sul B+tree
 - Il blob del catalogo non viene mai liberato: il suo indirizzo è univoco e fa da chiave per la cache dei piani
+- Aggregazioni parallele (`AggregateOp`): se l'input è una catena di operatori con `RowLocal == true` che parte da uno scan `IPartitionedScan` sopra `StartOp`, nelle transazioni di sola lettura lo spazio degli id viene diviso in blocchi; ogni worker ha un proprio `ExecContext` (`ForPartition`) e lo scan legge l'intervallo con `ctx.PartitionOf(this)`. I parziali si uniscono in ordine di blocco con `Aggregator.Merge`, così gruppi, snapshot e ordine di `collect()` coincidono con l'esecuzione sequenziale
+- Le pagine private (copy-on-write, overlay, recovery) si allocano con `Pages.Alloc` / `Pages.Free`, che usano un pool: mai `NativeMemory` direttamente
 
 ## Trappole (invarianti da rispettare)
 - **I cursori tengono indirizzi, non puntatori, tra una `Next()` e l'altra**: con `CALL { } IN TRANSACTIONS` può avvenire un checkpoint a metà query e i puntatori all'overlay diventerebbero invalidi
@@ -47,6 +50,8 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - La cache dei piani non deve mai memorizzare un piano se la transazione ha cambiato lo schema
 - I parametri del costruttore primario non sono accessibili dalle classi annidate: servono campi `private readonly` espliciti
 - `byte*` non può essere argomento di un generico (niente `Array.Resize` su `byte*[]`)
+- Un nuovo operatore è `RowLocal` solo se ogni riga d'uscita dipende da una sola riga d'ingresso e non ha effetti collaterali (niente `Limit`, `Distinct`, `Sort`, aggregazioni, scritture, procedure): altrimenti l'aggregazione parallela darebbe risultati sbagliati. Gli operatori e le closure dei piani devono restare thread-safe (sono già condivisi tra query dalla cache dei piani)
+- Gli aggregatori nuovi devono implementare `Merge`; `DistinctAgg.Merge` si appoggia all'ordine di inserimento di `HashSet` (vale finché non si rimuovono elementi)
 - `Path` collide con `System.IO.Path`: il tipo dei percorsi si chiama `GraphPath`, ma il membro dell'enum resta `ValueKind.Path`
 
 ## Scelte volute (non segnalarle come problemi)

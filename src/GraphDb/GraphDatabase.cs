@@ -31,6 +31,9 @@ public sealed class DatabaseOptions
 
     /// <summary>Allows LOAD CSV FROM 'http(s)://...'.</summary>
     public bool AllowRemoteCsv { get; init; }
+
+    /// <summary>Maximum threads used by one read-only query (parallel aggregation over large scans); 1 disables it.</summary>
+    public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
 }
 
 /// <summary>

@@ -20,8 +20,36 @@ internal static unsafe class Pages
 
     static Pages() => NativeMemory.Clear(Zero, Size);
 
-    public static byte* Alloc() => (byte*)NativeMemory.AlignedAlloc(Size, 64);
-    public static void Free(byte* p) => NativeMemory.AlignedFree(p);
+    /// <summary>
+    /// Pool of free page buffers. Copy-on-write allocates a page for every page a transaction touches and the
+    /// checkpoint frees them all at once: recycling them avoids the native heap, which dominated bulk loads.
+    /// </summary>
+    private static readonly nint[] _pool = new nint[PoolCapacity];
+    private static int _pooled;
+    private static readonly Lock _poolLock = new();
+    private const int PoolCapacity = 16384; // 128 MB
+
+    public static byte* Alloc()
+    {
+        lock (_poolLock)
+        {
+            if (_pooled > 0) return (byte*)_pool[--_pooled];
+        }
+        return (byte*)NativeMemory.AlignedAlloc(Size, 64);
+    }
+
+    public static void Free(byte* p)
+    {
+        lock (_poolLock)
+        {
+            if (_pooled < PoolCapacity)
+            {
+                _pool[_pooled++] = (nint)p;
+                return;
+            }
+        }
+        NativeMemory.AlignedFree(p);
+    }
     public static void Copy(byte* src, byte* dst) => Buffer.MemoryCopy(src, dst, Size, Size);
 }
 

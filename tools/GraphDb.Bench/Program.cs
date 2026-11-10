@@ -105,22 +105,29 @@ Parallel.For(0, threads, t =>
 });
 Report($"2-hop friends-of-friends ({threads} threads)", (long)hops * threads, sw.Elapsed);
 
-// ---------------------------------------------------------------- scans / aggregations
-sw.Restart();
-var agg = db.Execute("MATCH (p:Person) RETURN p.age AS age, count(*) AS c ORDER BY c DESC LIMIT 3");
-Report("label scan + group by age", nodes, sw.Elapsed);
+// ---------------------------------------------------------------- scans / aggregations (best of 5: warm JIT)
+T Best<T>(string name, long ops, Func<T> run)
+{
+    T result = default!;
+    var best = TimeSpan.MaxValue;
+    for (int i = 0; i < 5; i++)
+    {
+        var s = Stopwatch.StartNew();
+        result = run();
+        if (s.Elapsed < best) best = s.Elapsed;
+    }
+    Report(name, ops, best);
+    return result;
+}
 
-sw.Restart();
-var filt = db.Execute("MATCH (p:Person) WHERE p.age > 50 AND p.name STARTS WITH 'person1' RETURN count(p)").Scalar<long>();
-Report("label scan + filter", nodes, sw.Elapsed);
-
-sw.Restart();
-var relScan = db.Execute("MATCH (:Person)-[k:KNOWS]->(:Person) WHERE k.w < 10 RETURN count(k)").Scalar<long>();
-Report("expand all relationships + filter on rel prop", totalRels, sw.Elapsed);
-
-sw.Restart();
-var top = db.Execute("MATCH (p:Person)<-[:KNOWS]-(f) RETURN p.id, count(f) AS deg ORDER BY deg DESC LIMIT 5");
-Report("in-degree top-5 (aggregate + top-N)", totalRels, sw.Elapsed);
+var agg = Best("label scan + group by age", nodes,
+    () => db.Execute("MATCH (p:Person) RETURN p.age AS age, count(*) AS c ORDER BY c DESC LIMIT 3"));
+var filt = Best("label scan + filter", nodes,
+    () => db.Execute("MATCH (p:Person) WHERE p.age > 50 AND p.name STARTS WITH 'person1' RETURN count(p)").Scalar<long>());
+var relScan = Best("expand all relationships + filter on rel prop", totalRels,
+    () => db.Execute("MATCH (:Person)-[k:KNOWS]->(:Person) WHERE k.w < 10 RETURN count(k)").Scalar<long>());
+var top = Best("in-degree top-5 (aggregate + top-N)", totalRels,
+    () => db.Execute("MATCH (p:Person)<-[:KNOWS]-(f) RETURN p.id, count(f) AS deg ORDER BY deg DESC LIMIT 5"));
 
 sw.Restart();
 var sp = 0L;
