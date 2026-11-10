@@ -30,6 +30,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - `src/GraphDb/Cypher`: `Lexer`, `Parser`, `Ast`, `Planner`, `ExprCompiler` (espressioni → closure)
 - `src/GraphDb/Runtime`: operatori pull (`ReadOperators`, `WriteOperators`, `LoadCsv`), `Functions`, `Aggregation`, `Procedures`, `Core` (`ExecContext`)
 - `GraphDatabase.cs` (apertura, opzioni, cache dei piani, checkpoint), `Transaction.cs`, `QueryResult.cs`
+- `GraphDatabase.cs` / `Transaction.cs` / `QueryCursor.cs`: `Execute` materializza passando da `QueryCursor` (streaming); `StatementLog` registra le query delle transazioni concorrenti
 - `src/GraphDb.Server/Bolt`: server Bolt 4.4 / 5.0–5.4 (`PackStream`, `BoltValues` per la conversione dei valori, `BoltConnection` con la macchina a stati, `BoltServer`); `Program.cs` è la CLI. Accede agli internal della libreria (`InternalsVisibleTo`)
 
 ## Architettura (da sapere prima di toccare lo storage)
@@ -37,7 +38,10 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - I segmenti crescono in modo geometrico (1, 1, 2 … 32 MB, poi 64 MB) e **non vengono mai rimappati**: i puntatori alle pagine del file restano validi finché il database è aperto. All'apertura si mappano i file per intero
 - **MVCC a pagine**: lo scrittore lavora su copie private (`WriteTx`); al commit le pagine vanno nel WAL (solo i delta) e vengono pubblicate come catene `PageVersion` nell'overlay. Un lettore legge la versione con `Seq <= snapshot`, altrimenti la pagina del file. Le versioni vecchie si liberano **solo al checkpoint**
 - Checkpoint: `RwLock` esclusivo → `MergeOverlay` (copia le versioni più recenti nel file mappato) → flush dei file → troncamento del WAL. Automatico oltre `CheckpointThresholdBytes` (256 MB), bloccante oltre 8×
-- Scrittori serializzati da un `SemaphoreSlim` (writer gate); i lettori non vengono mai bloccati dallo scrittore, solo (brevemente) dal checkpoint
+- Scrittori esclusivi serializzati da un `SemaphoreSlim` (writer gate), tenuto per tutta la transazione; i lettori non vengono mai bloccati dallo scrittore, solo (brevemente) dal checkpoint
+- Transazioni **concorrenti** (`BeginConcurrentTransaction`, usate dal server per le transazioni esplicite di scrittura): `WriteTx` con snapshot (legge `Seq <= snapshot`), tengono il read lock del `RwLock` come i lettori. Al commit rilasciano il read lock **prima** di prendere il gate (altrimenti deadlock con un checkpoint urgente), poi: nessuna pagina sporca → niente; `CommittedSeq == Snapshot` → pubblicano; altrimenti scartano le pagine e **rieseguono** le query registrate (`StatementLog`: testo, parametri, orologio, seed, righe lette, hash `ResultHash` di righe e statistiche) in una transazione esclusiva, e committano solo se ogni esito coincide, altrimenti `TransactionConflictException` (Bolt: `Neo.TransientError.Transaction.Outdated`)
+- Gli id di nodi e relazioni vengono da contatori atomici in `GraphStore` (`NextNodeId` / `NextRelId`, inizializzati da `NodeHigh` / `RelHigh` all'apertura), non dall'header: le transazioni concorrenti non si scontrano e la riesecuzione riusa gli id riservati (`ReservedNodes` → `ReplayNodes`). L'header tiene `NodeHigh = max`. Gli scrittori esclusivi restituiscono gli id di uno statement o di una transazione annullati se nessuno ne ha riservati dopo (`IdRun`), così restano densi
+- Orologio e seed casuale di uno statement stanno in `ExecContext` (`Now`, `Seed`, letti in modo pigro): ogni funzione temporale o casuale deve usarli, mai `DateTime.UtcNow` / `Random.Shared`, altrimenti la riesecuzione darebbe risultati diversi e falsi conflitti
 - Recovery: replay dei frame del WAL validati da CRC32C; il replay è idempotente byte per byte, quindi corretto anche dopo un checkpoint interrotto
 - Indici: B+tree con chiavi `[tag][valore][id nodo 8 byte big-endian]`; il planner tiene **sempre** il predicato originale come filtro sopra al seek (le stringhe nelle chiavi sono troncate a 900 byte)
 - Gli indici unique hanno anche un `HashIndex` (`IndexDef.HashSlot`, flag nel catalogo; i cataloghi senza flag restano validi e usano solo il B+tree). Salva solo (hash a 64 bit, id), non i valori: i risultati sono **candidati** da verificare (filtro del planner, `FindConflict`). `HashIndex.HashOf` è persistito su disco: non va mai cambiato. Usato per `Equal`/`In` nel seek e per i controlli di unicità; range, prefissi e backfill restano sul B+tree
@@ -55,6 +59,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 - Un nuovo operatore è `RowLocal` solo se ogni riga d'uscita dipende da una sola riga d'ingresso e non ha effetti collaterali (niente `Limit`, `Distinct`, `Sort`, aggregazioni, scritture, procedure): altrimenti l'aggregazione parallela darebbe risultati sbagliati. Gli operatori e le closure dei piani devono restare thread-safe (sono già condivisi tra query dalla cache dei piani)
 - Gli aggregatori nuovi devono implementare `Merge`; `DistinctAgg.Merge` si appoggia all'ordine di inserimento di `HashSet` (vale finché non si rimuovono elementi)
 - Server Bolt: `localhost` risolve prima a `::1`, per questo `BoltServer` ascolta anche sul loopback IPv6 (senza, ogni connessione dei driver aspetta ~2 s). L'agent di default è `Neo4j/5.26.0` perché alcuni driver decidono le funzionalità dalla versione. Gli element id sono `n:<id>` / `r:<id>`, come `elementId()`: vanno cambiati insieme
+- `QueryCursor`: una sola query aperta per transazione; iniziarne un'altra (o il commit) chiama `Detach` / `Dispose` su quella aperta. `Dispose` prima della fine ferma una lettura ma porta sempre a termine una scrittura. Un cursore di `db.Stream` possiede la sua transazione e la chiude a fine risultato
 - I test con `Neo4j.Driver` importano `using Neo4j.Driver;` per `As<T>()`: i tipi omonimi (`GraphDatabase`, `Node`…) si risolvono comunque su `GraphDb` perché il namespace contenitore ha la precedenza; per i tipi del driver usare l'alias `N.`
 - `Path` collide con `System.IO.Path`: il tipo dei percorsi si chiama `GraphPath`, ma il membro dell'enum resta `ValueKind.Path`
 
@@ -76,6 +81,7 @@ Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'
 ## Come lavorare
 - Git lo gestisce l'utente: niente commit, cambi di branch o merge se non richiesti
 - I fine riga (CRLF su disco) li gestisce git: non serve preoccuparsene né verificarli
+- Gli script Python passati a Git Bash con un heredoc si rompono se contengono apostrofi (`l'indirizzo`): scriverli in un file nello scratchpad con il tool Write
 - Con PowerShell: le here-string producono CRLF e i `-replace` multilinea non trovano il testo (meglio il tool Edit); `R` è un alias di `Invoke-History`, non usarlo come nome di funzione
 - Ogni modifica allo storage va verificata con i test di `StorageTests.cs` (crash simulati, WAL troncato, confronto casuale con un riferimento in memoria), ripetuti più volte perché quelli di concorrenza sono probabilistici
 - Le risposte all'utente sono in italiano

@@ -160,14 +160,14 @@ internal static class Functions
                         var tzArg = a.Length > 0 ? a[0] : null;
                         return ctx =>
                         {
-                            var now = Temporal.Construct("datetime", []);
+                            var now = Temporal.Construct("datetime", [], name.EndsWith(".realtime", StringComparison.Ordinal) ? System.DateTime.UtcNow : ctx.Now);
                             if (tzArg is null) return kind == "datetime" ? now : Temporal.Convert(kind, now, null);
                             var zoned = Value.FromZonedUtc(now.Num, ZoneInfo.FromName(tzArg(ctx).AsString()));
                             return kind == "datetime" ? zoned : Temporal.Convert(kind, zoned, null);
                         };
                     }
                     var args = a;
-                    return ctx => Temporal.Construct(kind, args.Length == 0 ? [] : [args[0](ctx)]);
+                    return ctx => Temporal.Construct(kind, args.Length == 0 ? [] : [args[0](ctx)], ctx.Now);
                 }
             case "date.truncate":
             case "localtime.truncate":
@@ -386,13 +386,20 @@ internal static class Functions
                 return F1(name, a, (ctx, v) => Value.FromBool(!v.IsNull));
             case "timestamp":
                 Arity(name, a, 0, 0);
-                return ctx => Value.FromInt(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                return ctx => Value.FromInt(new DateTimeOffset(ctx.Now.Ticks, TimeSpan.Zero).ToUnixTimeMilliseconds());
             case "randomuuid":
                 Arity(name, a, 0, 0);
-                return ctx => Value.FromString(Guid.NewGuid().ToString());
+                return ctx =>
+                {
+                    Span<byte> b = stackalloc byte[16];
+                    ctx.Random.NextBytes(b);
+                    b[7] = (byte)(b[7] & 0x0F | 0x40); // version 4
+                    b[8] = (byte)(b[8] & 0x3F | 0x80); // RFC 4122 variant
+                    return Value.FromString(new Guid(b).ToString());
+                };
             case "rand":
                 Arity(name, a, 0, 0);
-                return ctx => Value.FromFloat(Random.Shared.NextDouble());
+                return ctx => Value.FromFloat(ctx.Random.NextDouble());
             case "pi":
                 Arity(name, a, 0, 0);
                 return ctx => Value.FromFloat(Math.PI);

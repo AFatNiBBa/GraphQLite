@@ -90,6 +90,12 @@ internal sealed unsafe class GraphStore : IDisposable
     public readonly TokenTable PropKeys = new();
     private readonly ConcurrentDictionary<long, Catalog> _catalogs = new();
 
+    /// <summary>
+    /// Next node / relationship id. Ids are handed out here rather than from the header page, so that concurrent
+    /// transactions never pick the same id and a replayed transaction can reuse the ids it reserved.
+    /// </summary>
+    internal long NextNodeId, NextRelId;
+
     private GraphStore(Pager pager) => Pager = pager;
 
     public static GraphStore Open(string? path, SyncMode sync)
@@ -128,6 +134,8 @@ internal sealed unsafe class GraphStore : IDisposable
             Pager.FlushAndTruncateWal();
             return;
         }
+        NextNodeId = h->NodeHigh;
+        NextRelId = h->RelHigh;
         if (h->Magic != Header.MagicValue) throw new GraphDbException("Not a GraphDb database (or an incompatible format version)");
         if (h->Version != Header.CurrentVersion) throw new GraphDbException($"Unsupported database format version {h->Version}");
         if (h->PageSize != Pages.Size) throw new GraphDbException("Unsupported page size");
@@ -138,6 +146,13 @@ internal sealed unsafe class GraphStore : IDisposable
 
     /// <summary>Caller holds the writer gate.</summary>
     public StoreTx BeginWrite() => new(this, new WriteTx(Pager), long.MaxValue);
+
+    /// <summary>Optimistic writer on the current snapshot: needs no gate until it commits.</summary>
+    public StoreTx BeginConcurrentWrite()
+    {
+        long seq = Pager.CommittedSeq;
+        return new(this, new WriteTx(Pager, seq), seq) { ReservedNodes = new(), ReservedRels = new() };
+    }
 
     internal Catalog GetCommittedCatalog(long addr, StoreTx tx)
     {
@@ -164,6 +179,62 @@ internal sealed unsafe class StoreTx
     private long _ownCatalogAddr = -1;
     /// <summary>True when this transaction changed the schema (plans must not be cached).</summary>
     public bool SchemaChanged;
+
+    /// <summary>Ids reserved by a concurrent transaction (null otherwise), reused when it is replayed.</summary>
+    internal List<long>? ReservedNodes, ReservedRels;
+    /// <summary>Ids to reuse, in order, while replaying a concurrent transaction.</summary>
+    internal Queue<long>? ReplayNodes, ReplayRels;
+    private IdRun _nodeIds = IdRun.Empty, _relIds = IdRun.Empty;
+
+    /// <summary>
+    /// Ids reserved by an exclusive transaction since its last commit, while contiguous: a rolled back statement or
+    /// transaction gives them back if nobody reserved ids after it, so a single writer keeps ids dense.
+    /// </summary>
+    private struct IdRun
+    {
+        public long Start, End, StatementStart;
+        public static IdRun Empty => new() { Start = -1, End = -1, StatementStart = -1 };
+
+        public void Reserved(long id)
+        {
+            if (id != End) Start = StatementStart = id;
+            End = id + 1;
+        }
+
+        public void BeginStatement() => StatementStart = End;
+
+        public void RollbackStatement(ref long counter)
+        {
+            if (StatementStart >= 0 && End > StatementStart && Interlocked.CompareExchange(ref counter, StatementStart, End) == End)
+                End = StatementStart;
+        }
+
+        public void Abort(ref long counter)
+        {
+            if (Start >= 0 && End > Start) Interlocked.CompareExchange(ref counter, Start, End);
+            this = Empty;
+        }
+
+        public void Commit() => Start = StatementStart = End;
+    }
+
+    private long NewNodeId()
+    {
+        if (ReplayNodes != null && ReplayNodes.TryDequeue(out long id)) return id;
+        id = Interlocked.Increment(ref G.NextNodeId) - 1;
+        if (ReservedNodes != null) ReservedNodes.Add(id);
+        else _nodeIds.Reserved(id);
+        return id;
+    }
+
+    private long NewRelId()
+    {
+        if (ReplayRels != null && ReplayRels.TryDequeue(out long id)) return id;
+        id = Interlocked.Increment(ref G.NextRelId) - 1;
+        if (ReservedRels != null) ReservedRels.Add(id);
+        else _relIds.Reserved(id);
+        return id;
+    }
 
     internal StoreTx(GraphStore g, WriteTx? w, long snapshot)
     {
@@ -445,6 +516,8 @@ internal sealed unsafe class StoreTx
         W.Commit();
         foreach (var k in new[] { TokenKind.Label, TokenKind.RelType, TokenKind.PropKey })
             G.TokensOf(k).PersistedCount = G.TokensOf(k).Count;
+        _nodeIds.Commit();
+        _relIds.Commit();
         _ownCatalog = null;
         _ownCatalogAddr = -1;
     }
@@ -452,16 +525,27 @@ internal sealed unsafe class StoreTx
     public void Abort()
     {
         W?.Abort();
+        _nodeIds.Abort(ref G.NextNodeId);
+        _relIds.Abort(ref G.NextRelId);
         _ownCatalog = null;
         _ownCatalogAddr = -1;
     }
 
-    public void BeginStatement() => W?.BeginSavepoint();
+    public void BeginStatement()
+    {
+        if (W is null) return;
+        W.BeginSavepoint();
+        _nodeIds.BeginStatement();
+        _relIds.BeginStatement();
+    }
+
     public void EndStatement() => W?.ReleaseSavepoint();
 
     public void RollbackStatement()
     {
         W?.RollbackToSavepoint();
+        _nodeIds.RollbackStatement(ref G.NextNodeId);
+        _relIds.RollbackStatement(ref G.NextRelId);
         _ownCatalog = null;
         _ownCatalogAddr = -1;
     }
@@ -899,7 +983,7 @@ internal sealed unsafe class StoreTx
 
     public long CreateNode(int[]? labels, PropertyMap? props)
     {
-        long id = H->NodeHigh;
+        long id = NewNodeId();
         labels = labels is { Length: > 0 } ? labels.Distinct().Order().ToArray() : null;
         var cat = Catalog;
         if (labels != null && props != null && cat.Indexes.Length > 0)
@@ -907,7 +991,7 @@ internal sealed unsafe class StoreTx
                 foreach (var ix in cat.ForLabel(l))
                     if (props.TryGet(ix.Key, out var v)) CheckUnique(ix, v, id);
         var h = HW;
-        h->NodeHigh = id + 1;
+        if (id >= h->NodeHigh) h->NodeHigh = id + 1;
         h->NodeCount++;
         var n = NW(id);
         *n = default;
@@ -1131,9 +1215,9 @@ internal sealed unsafe class StoreTx
     public long CreateRel(long src, long dst, int type, PropertyMap? props)
     {
         if (!NodeAlive(src) || !NodeAlive(dst)) throw new CypherRuntimeException("Cannot create a relationship to a deleted node");
-        long id = H->RelHigh;
+        long id = NewRelId();
         var h = HW;
-        h->RelHigh = id + 1;
+        if (id >= h->RelHigh) h->RelHigh = id + 1;
         h->RelCount++;
         var data = EncodeProps(props);
         long pa = data is null ? 0 : StoreBlob(data);

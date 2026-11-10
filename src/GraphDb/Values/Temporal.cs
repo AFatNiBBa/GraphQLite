@@ -508,9 +508,11 @@ internal static class Temporal
 
     private static readonly System.DateTime Epoch = new(1970, 1, 1);
 
-    public static Value Construct(string kind, Value[] args)
+    public static Value Construct(string kind, Value[] args) => Construct(kind, args, System.DateTime.UtcNow);
+
+    /// <param name="now">Current instant (UTC): the statement clock.</param>
+    public static Value Construct(string kind, Value[] args, System.DateTime now)
     {
-        var now = System.DateTime.UtcNow;
         if (args.Length == 0)
         {
             return kind switch

@@ -66,6 +66,34 @@ internal sealed class ExecContext
     public Action? CommitBatch;
     private int _tick;
 
+    private long _nowTicks;
+    private int? _seed;
+    private Random? _random;
+
+    /// <summary>
+    /// Statement clock (UTC): every time function of one statement sees the same instant, as in Neo4j. Read lazily,
+    /// so statements that do not use it pay nothing.
+    /// </summary>
+    public System.DateTime Now
+    {
+        get
+        {
+            if (_nowTicks == 0) _nowTicks = System.DateTime.UtcNow.Ticks;
+            return new System.DateTime(_nowTicks, DateTimeKind.Utc);
+        }
+        set => _nowTicks = value.Ticks;
+    }
+
+    /// <summary>Seed of <see cref="Random"/>: recorded so that a statement can be replayed with the same random values.</summary>
+    public int Seed
+    {
+        get => _seed ??= System.Random.Shared.Next();
+        set => _seed = value;
+    }
+
+    /// <summary>Source of rand() and randomUUID() (not thread-safe: parallel workers get their own).</summary>
+    public Random Random => _random ??= new Random(Seed);
+
     /// <summary>Scan restricted to a node id range (parallel aggregation workers), see <see cref="PartitionOf"/>.</summary>
     private Operator? _partitionLeaf;
     private long _partitionLow, _partitionHigh;
@@ -87,6 +115,8 @@ internal sealed class ExecContext
             _partitionLeaf = leaf,
             _partitionLow = low,
             _partitionHigh = high,
+            Now = Now,
+            Seed = HashCode.Combine(Seed, low),
         };
         Row.AsSpan().CopyTo(w.Row);
         return w;

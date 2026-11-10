@@ -373,10 +373,14 @@ internal sealed unsafe class Pager : IDisposable
     }
 }
 
-/// <summary>Private page copies of the (single) write transaction, with statement savepoints.</summary>
+/// <summary>
+/// Private page copies of a write transaction, with statement savepoints. The exclusive writer reads the latest
+/// committed pages; a concurrent (optimistic) writer reads the snapshot it started from.
+/// </summary>
 internal sealed unsafe class WriteTx
 {
     private readonly Pager _pager;
+    private readonly long _snapshot;
     private readonly PageTable<nint>[] _dirty = [new(), new(), new()];
     private List<(long Key, nint Ptr)> _dirtyList = new();
     private Dictionary<long, nint>? _spBackup;
@@ -385,7 +389,11 @@ internal sealed unsafe class WriteTx
     private long _lastKey = -1;
     private byte* _lastPtr;
 
-    public WriteTx(Pager pager) => _pager = pager;
+    public WriteTx(Pager pager, long snapshot = long.MaxValue)
+    {
+        _pager = pager;
+        _snapshot = snapshot;
+    }
 
     public int DirtyCount => _dirtyList.Count;
 
@@ -393,7 +401,7 @@ internal sealed unsafe class WriteTx
     public byte* Read(Space s, long page)
     {
         nint p = _dirty[(int)s].Get(page);
-        return p != 0 ? (byte*)p : _pager.Read(s, page, long.MaxValue);
+        return p != 0 ? (byte*)p : _pager.Read(s, page, _snapshot);
     }
 
     /// <summary>Returns a writable private copy of the page.</summary>
@@ -425,7 +433,7 @@ internal sealed unsafe class WriteTx
         {
             p = Pages.Alloc();
             if (fresh) NativeMemory.Clear(p, Pages.Size);
-            else Pages.Copy(_pager.Read(s, page, long.MaxValue), p);
+            else Pages.Copy(_pager.Read(s, page, _snapshot), p);
             _dirty[(int)s].Set(page, (nint)p);
             _dirtyList.Add((key, (nint)p));
             _spCreated?.Add(key);

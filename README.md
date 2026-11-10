@@ -27,6 +27,10 @@ using (var tx = db.BeginTransaction())                     // transazione esplic
     tx.Execute("MATCH (p:Person {name: 'Bob'}) SET p.visits = coalesce(p.visits, 0) + 1");
     tx.Commit();                                           // Dispose senza Commit = rollback
 }
+
+using (var cursor = db.Stream("MATCH (p:Person) RETURN p.name AS name"))  // righe prodotte mentre si leggono
+    while (cursor.MoveNext())
+        Console.WriteLine(cursor.Current.Get<string>("name"));
 ```
 
 ## Struttura
@@ -75,8 +79,24 @@ Un database è una **directory**:
 - Lo scrittore modifica **copie private** delle pagine (copy-on-write). Al commit le pagine vengono scritte nel WAL e
   pubblicate come nuove *versioni* in memoria.
 - Ogni lettura lavora su uno **snapshot**: vede sempre e solo transazioni committate per intero, e **non viene mai
-  bloccata dagli scrittori** (né viceversa). Si possono eseguire letture concorrenti illimitate, mentre gli scrittori
-  vengono serializzati.
+  bloccata dagli scrittori** (né viceversa). Si possono eseguire letture concorrenti illimitate.
+- Due tipi di transazione di scrittura:
+  - **esclusive** (`db.BeginTransaction()`, e le query in auto-commit di `db.Execute`): una alla volta, non falliscono
+    mai per conflitto. Sono le più veloci quando il lavoro è tutto nel codice dell'applicazione;
+  - **concorrenti** (`db.BeginConcurrentTransaction()`): non aspettano gli altri scrittori e non li bloccano, anche se
+    restano aperte a lungo (per esempio una transazione interattiva di un client). Lavorano su uno snapshot; al commit,
+    se nel frattempo qualcuno ha committato, le loro query vengono **rieseguite** sullo stato più recente e la
+    transazione committa solo se ogni query restituisce lo stesso risultato della prima volta. Altrimenti `Commit`
+    lancia `TransactionConflictException` e non scrive nulla: la transazione va ripetuta. Il risultato è
+    **serializzabile** e non ci sono aggiornamenti persi: due `SET c.v = c.v + 1` concorrenti committano entrambi e
+    il contatore sale di 2. Gli id dei nodi creati, l'orologio della query (`datetime()`, `timestamp()`) e i valori
+    di `rand()` / `randomUUID()` restano gli stessi nella riesecuzione, quindi un `CREATE … RETURN n` non va in
+    conflitto. Una transazione concorrente che ha solo letto non viene mai rieseguita.
+- I risultati si possono leggere in **streaming** (`db.Stream` / `tx.Stream` restituiscono un `QueryCursor`): le righe
+  vengono prodotte mentre si leggono, con memoria costante anche per miliardi di righe. Iniziare un'altra query nella
+  stessa transazione mette da parte le righe non ancora lette; chiudere il cursore prima della fine ferma una lettura,
+  mentre una query di scrittura viene comunque completata. Con `db.Stream` una query di scrittura tiene il turno di
+  scrittura finché il cursore non viene chiuso.
 - Il **checkpoint** (automatico oltre `CheckpointThresholdBytes`, 256 MB, oppure con `db.Checkpoint()`) copia le versioni più
   recenti nei file mappati, li sincronizza su disco e tronca il WAL. Esclude i lettori solo per il tempo della copia in
   memoria.
@@ -243,6 +263,9 @@ dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
 - **Un solo processo** per database: la directory è aperta in esclusiva. Più processi richiederebbero un indice delle
   versioni in shared memory e lock tra processi (come il file `-shm` di SQLite). Si può aggiungere, ma è un pezzo
   di architettura a sé. Per condividere un database tra più processi o macchine si usa `GraphDb.Server`.
+- Le transazioni concorrenti rieseguono le query al commit se nel frattempo altri hanno committato: con molti
+  scrittori che toccano gli stessi dati costano più delle esclusive e possono andare in conflitto ripetutamente.
+  Gli id dei nodi e delle relazioni delle transazioni annullate o in conflitto non vengono riutilizzati.
 - Le query parallele riguardano solo le aggregazioni sopra una scansione di nodi: le query che restituiscono molte righe
   senza aggregare, e le transazioni di scrittura, restano su un solo thread.
 - Le date sono limitate agli anni 1–9999 e la precisione temporale è di 100 ns (tick .NET).

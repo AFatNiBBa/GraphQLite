@@ -92,6 +92,9 @@ public sealed class GraphPath
         _rels = rels;
     }
 
+    internal Node[]? MaterializedNodes => _nodes;
+    internal Relationship[]? MaterializedRels => _rels;
+
     public int Length => RelIds.Length;
     public IReadOnlyList<Node> Nodes => _nodes ?? throw new InvalidOperationException("GraphPath is not materialized");
     public IReadOnlyList<Relationship> Relationships => _rels ?? throw new InvalidOperationException("GraphPath is not materialized");

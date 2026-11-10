@@ -31,3 +31,12 @@ public sealed class ConstraintViolationException : GraphDbException
 {
     public ConstraintViolationException(string message) : base(message) { }
 }
+
+/// <summary>
+/// A concurrent transaction could not commit because another transaction changed data it depends on. Nothing was
+/// written: retry the whole transaction (Neo4j drivers do it automatically for managed transactions).
+/// </summary>
+public sealed class TransactionConflictException : GraphDbException
+{
+    public TransactionConflictException(string message) : base(message) { }
+}

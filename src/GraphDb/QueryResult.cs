@@ -22,13 +22,38 @@ public sealed record QueryStatistics(
         IndexesAdded + IndexesRemoved > 0;
 }
 
+/// <summary>Column names of a result, with a lookup by name.</summary>
+internal sealed class ColumnSet(string[] names)
+{
+    public readonly string[] Columns = names;
+    private Dictionary<string, int>? _index;
+
+    public int IndexOf(string column)
+    {
+        var cols = Columns;
+        if (cols.Length <= 8)
+        {
+            for (int i = 0; i < cols.Length; i++)
+                if (string.Equals(cols[i], column, StringComparison.Ordinal)) return i;
+            return -1;
+        }
+        if (_index is null)
+        {
+            var d = new Dictionary<string, int>(cols.Length, StringComparer.Ordinal);
+            for (int i = 0; i < cols.Length; i++) d.TryAdd(cols[i], i);
+            _index = d;
+        }
+        return _index.TryGetValue(column, out var ix) ? ix : -1;
+    }
+}
+
 /// <summary>One result row.</summary>
 public sealed class Record : IReadOnlyDictionary<string, Value>
 {
-    private readonly QueryResult _owner;
+    private readonly ColumnSet _owner;
     private readonly Value[] _values;
 
-    internal Record(QueryResult owner, Value[] values)
+    internal Record(ColumnSet owner, Value[] values)
     {
         _owner = owner;
         _values = values;
@@ -98,36 +123,22 @@ public sealed class Record : IReadOnlyDictionary<string, Value>
 public sealed class QueryResult : IReadOnlyList<Record>
 {
     private readonly List<Record> _rows;
-    private Dictionary<string, int>? _colIndex;
+    private readonly ColumnSet _cols;
 
-    public IReadOnlyList<string> Columns { get; }
+    public IReadOnlyList<string> Columns => _cols.Columns;
     public QueryStatistics Statistics { get; }
 
-    internal QueryResult(string[] columns, List<Value[]> rows, QueryStatistics stats)
+    internal QueryResult(string[] columns, List<Value[]> rows, QueryStatistics stats) : this(new ColumnSet(columns), rows, stats) { }
+
+    internal QueryResult(ColumnSet columns, List<Value[]> rows, QueryStatistics stats)
     {
-        Columns = columns;
+        _cols = columns;
         Statistics = stats;
         _rows = new List<Record>(rows.Count);
-        foreach (var r in rows) _rows.Add(new Record(this, r));
+        foreach (var r in rows) _rows.Add(new Record(columns, r));
     }
 
-    internal int IndexOf(string column)
-    {
-        var cols = Columns;
-        if (cols.Count <= 8)
-        {
-            for (int i = 0; i < cols.Count; i++)
-                if (string.Equals(cols[i], column, StringComparison.Ordinal)) return i;
-            return -1;
-        }
-        if (_colIndex is null)
-        {
-            var d = new Dictionary<string, int>(cols.Count, StringComparer.Ordinal);
-            for (int i = 0; i < cols.Count; i++) d.TryAdd(cols[i], i);
-            _colIndex = d;
-        }
-        return _colIndex.TryGetValue(column, out var ix) ? ix : -1;
-    }
+    internal ColumnSet ColumnSet => _cols;
 
     public int Count => _rows.Count;
     public Record this[int index] => _rows[index];
@@ -170,6 +181,9 @@ public sealed class QueryResult : IReadOnlyList<Record>
 
     internal sealed class Materializer(StoreTx store)
     {
+        /// <summary>Entities cached per kind: bounded, so that a streamed result does not grow without limit.</summary>
+        private const int MaxCached = 4096;
+
         private Dictionary<long, Node>? _nodes;
         private Dictionary<long, Relationship>? _rels;
 
@@ -218,6 +232,7 @@ public sealed class QueryResult : IReadOnlyList<Record>
         private Node GetNode(long id)
         {
             _nodes ??= new Dictionary<long, Node>();
+            if (_nodes.Count >= MaxCached) _nodes.Clear();
             if (!_nodes.TryGetValue(id, out var n)) _nodes[id] = n = store.MaterializeNode(id);
             return n;
         }
@@ -225,6 +240,7 @@ public sealed class QueryResult : IReadOnlyList<Record>
         private Relationship GetRel(long id)
         {
             _rels ??= new Dictionary<long, Relationship>();
+            if (_rels.Count >= MaxCached) _rels.Clear();
             if (!_rels.TryGetValue(id, out var r)) _rels[id] = r = store.MaterializeRel(id);
             return r;
         }

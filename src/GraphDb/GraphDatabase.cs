@@ -39,8 +39,8 @@ public sealed class DatabaseOptions
 /// <summary>
 /// Embedded graph database queried with openCypher. Runs in-process, like SQLite. The graph lives in a
 /// directory of memory-mapped files and can be much larger than RAM.
-/// <para>Concurrency: any number of concurrent readers, each seeing a consistent snapshot; one writer at a
-/// time. Readers are never blocked by writers (multi-version pages); only the short checkpoint phase
+/// <para>Concurrency: any number of concurrent readers, each seeing a consistent snapshot; one exclusive writer
+/// at a time, or any number of concurrent (optimistic) writers, see <see cref="BeginConcurrentTransaction"/>. Readers are never blocked by writers (multi-version pages); only the short checkpoint phase
 /// needs exclusive access.</para>
 /// </summary>
 public sealed class GraphDatabase : IDisposable
@@ -108,6 +108,29 @@ public sealed class GraphDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Begins a concurrent (optimistic) write transaction: it does not wait for other writers and does not block them.
+    /// It works on a snapshot; at commit, if other transactions committed in the meantime, its statements are
+    /// replayed on the latest state and it commits only if they return the same results, otherwise
+    /// <see cref="Transaction.Commit"/> throws <see cref="TransactionConflictException"/> and the transaction must be
+    /// retried. Suited to interactive transactions (e.g. a client that keeps a transaction open between requests);
+    /// for throughput an exclusive <see cref="BeginTransaction"/> is cheaper, since it never replays.
+    /// </summary>
+    public Transaction BeginConcurrentTransaction()
+    {
+        ThrowIfDisposed();
+        Lock.EnterRead(); // keeps the snapshot's page versions alive until commit
+        try
+        {
+            return new Transaction(this, Store.BeginConcurrentWrite(), autoCommit: false, concurrent: true);
+        }
+        catch
+        {
+            Lock.ExitRead();
+            throw;
+        }
+    }
+
     /// <summary>Begins a read-only transaction on a consistent snapshot. Many can run concurrently.</summary>
     public Transaction BeginReadTransaction()
     {
@@ -142,6 +165,34 @@ public sealed class GraphDatabase : IDisposable
             var result = tx.Execute(query, parameters, cancellationToken);
             tx.Commit();
             return result;
+        }
+    }
+
+    /// <summary>
+    /// Executes a query in its own transaction and streams the rows (constant memory for results of any size). The
+    /// transaction commits when the cursor is exhausted or disposed; an updating query holds the writer gate until
+    /// then, so read the cursor promptly.
+    /// </summary>
+    public QueryCursor Stream(string query, IReadOnlyDictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
+    {
+        var cached = GetStatement(query);
+        Transaction tx;
+        if (cached.IsWrite)
+        {
+            ThrowIfDisposed();
+            WriterGate.Wait(cancellationToken);
+            try { tx = new Transaction(this, Store.BeginWrite(), autoCommit: true); }
+            catch { WriterGate.Release(); throw; }
+        }
+        else tx = BeginReadTransaction();
+        try
+        {
+            return tx.Open(query, parameters, cancellationToken, ownsTransaction: true, null);
+        }
+        catch
+        {
+            tx.Dispose();
+            throw;
         }
     }
 

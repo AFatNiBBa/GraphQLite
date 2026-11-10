@@ -49,7 +49,8 @@ internal static class Procedures
             var s = ctx.Store;
             return [[Value.FromInt(s.NodeCount), Value.FromInt(s.RelCount), Value.FromInt(s.Labels.Count), Value.FromInt(s.RelTypes.Count),
                 Value.FromInt(s.PropKeys.Count), Value.FromInt(s.DataPages)]];
-        });        Add("dbms.components", ["name", "versions", "edition"], (ctx, _) =>
+        });
+        Add("dbms.components", ["name", "versions", "edition"], (ctx, _) =>
             [[Value.FromString("GraphDb"), Value.FromList([Value.FromString(typeof(Procedures).Assembly.GetName().Version?.ToString() ?? "0")]), Value.FromString("embedded")]]);
     }
 
@@ -57,6 +58,8 @@ internal static class Procedures
         All[name] = new Procedure(name, outputs, body);
 
     public static Procedure? Find(string name) => All.TryGetValue(name, out var p) ? p : null;
+
+    public static IEnumerable<Procedure> List => All.Values;
 }
 
 internal sealed class ProcedureCallOp(Operator input, Procedure proc, Eval[] args, int[] outSlots) : UnaryOperator(input)
