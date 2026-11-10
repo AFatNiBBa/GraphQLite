@@ -1,0 +1,368 @@
+using GraphDb.Cypher;
+using GraphDb.Storage;
+
+namespace GraphDb.Runtime;
+
+internal delegate PropertyMap? PropsBuilder(ExecContext ctx);
+internal sealed record CreateNodeSpec(int Slot, TokenRef[] Labels, PropsBuilder? Props);
+internal sealed record CreateRelSpec(int Slot, int FromSlot, int ToSlot, TokenRef Type, PropsBuilder? Props);
+internal sealed record PathSpec(int PathSlot, int[] NodeSlots, int[] RelSlots);
+
+internal sealed class CreateSpec(CreateNodeSpec[] nodes, CreateRelSpec[] rels, PathSpec[] paths)
+{
+    public readonly CreateNodeSpec[] Nodes = nodes;
+    public readonly CreateRelSpec[] Rels = rels;
+    public readonly PathSpec[] Paths = paths;
+
+    public void Execute(ExecContext ctx)
+    {
+        var store = ctx.Store;
+        var log = ctx.WriteLog;
+        var row = ctx.Row;
+        foreach (var n in Nodes)
+        {
+            int[]? labels = null;
+            if (n.Labels.Length > 0)
+            {
+                labels = new int[n.Labels.Length];
+                for (int i = 0; i < labels.Length; i++) labels[i] = n.Labels[i].GetOrCreate(store);
+                labels = labels.Distinct().ToArray();
+            }
+            var props = n.Props?.Invoke(ctx);
+            int id = store.CreateNode(labels, props, log);
+            ctx.Stats.NodesCreated++;
+            ctx.Stats.LabelsAdded += labels?.Length ?? 0;
+            ctx.Stats.PropertiesSet += props?.Count ?? 0;
+            row[n.Slot] = Value.FromNodeId(id);
+        }
+        foreach (var r in Rels)
+        {
+            var a = row[r.FromSlot];
+            var b = row[r.ToSlot];
+            if (a.Kind != ValueKind.Node || b.Kind != ValueKind.Node)
+                throw new CypherRuntimeException("Failed to create relationship: endpoint node is null");
+            var props = r.Props?.Invoke(ctx);
+            int id = store.CreateRel(a.EntityId, b.EntityId, r.Type.GetOrCreate(store), props, log);
+            ctx.Stats.RelationshipsCreated++;
+            ctx.Stats.PropertiesSet += props?.Count ?? 0;
+            row[r.Slot] = Value.FromRelId(id);
+        }
+        foreach (var p in Paths) row[p.PathSlot] = BuildPathOp.Build(ctx, p.NodeSlots, p.RelSlots);
+    }
+}
+
+internal sealed class CompiledSetItem(SetKind kind, Eval target, TokenRef? key, Eval? value, TokenRef[]? labels)
+{
+    public readonly SetKind Kind = kind;
+    public readonly Eval Target = target;
+    public readonly TokenRef? Key = key;
+    public readonly Eval? Value = value;
+    public readonly TokenRef[]? Labels = labels;
+}
+
+internal static class Mutations
+{
+    public static PropertyMap? BuildProps(ExecContext ctx, Value map)
+    {
+        if (map.IsNull) return null;
+        if (map.Kind != ValueKind.Map) throw new CypherRuntimeException($"Expected a map of properties, got {map.Kind}");
+        var m = map.MapItems;
+        if (m.Count == 0) return null;
+        var props = new PropertyMap(m.Count);
+        foreach (var kv in m)
+        {
+            if (kv.Value.IsNull) continue;
+            GraphStore.ValidatePropertyValue(kv.Value);
+            props.Set(ctx.Store.PropKeys.GetOrCreate(kv.Key), kv.Value);
+        }
+        return props.Count == 0 ? null : props;
+    }
+
+    private static void SetProp(ExecContext ctx, in Value entity, int key, in Value v)
+    {
+        if (entity.Kind == ValueKind.Node) ctx.Store.SetNodeProp(entity.EntityId, key, v, ctx.WriteLog);
+        else ctx.Store.SetRelProp(entity.EntityId, key, v, ctx.WriteLog);
+        ctx.Stats.PropertiesSet++;
+    }
+
+    private static PropertyMap? PropsOf(ExecContext ctx, in Value entity) =>
+        entity.Kind == ValueKind.Node ? ctx.Store.Nodes[entity.EntityId].Props : ctx.Store.Rels[entity.EntityId].Props;
+
+    private static void CheckEntity(ExecContext ctx, in Value e)
+    {
+        if (e.Kind == ValueKind.Node && !ctx.Store.NodeAlive(e.EntityId) || e.Kind == ValueKind.Relationship && !ctx.Store.RelAlive(e.EntityId))
+            throw new CypherRuntimeException("Cannot set properties on a deleted entity");
+    }
+
+    public static void ApplySet(ExecContext ctx, CompiledSetItem item)
+    {
+        var target = item.Target(ctx);
+        if (target.IsNull) return;
+        var store = ctx.Store;
+        switch (item.Kind)
+        {
+            case SetKind.Property:
+                {
+                    if (target.Kind is not (ValueKind.Node or ValueKind.Relationship))
+                        throw new CypherRuntimeException($"SET requires a node or relationship, got {target.Kind}");
+                    CheckEntity(ctx, target);
+                    var v = item.Value!(ctx);
+                    if (v.IsNull)
+                    {
+                        int k = item.Key!.Resolve(store);
+                        if (k >= 0) SetProp(ctx, target, k, v);
+                    }
+                    else SetProp(ctx, target, item.Key!.GetOrCreate(store), v);
+                    break;
+                }
+            case SetKind.ReplaceMap:
+            case SetKind.MergeMap:
+                {
+                    if (target.Kind is not (ValueKind.Node or ValueKind.Relationship))
+                        throw new CypherRuntimeException($"SET requires a node or relationship, got {target.Kind}");
+                    CheckEntity(ctx, target);
+                    var src = item.Value!(ctx);
+                    Dictionary<string, Value> map = src.Kind switch
+                    {
+                        ValueKind.Map => src.MapItems,
+                        ValueKind.Node => store.PropsToMap(store.Nodes[src.EntityId].Props),
+                        ValueKind.Relationship => store.PropsToMap(store.Rels[src.EntityId].Props),
+                        ValueKind.Null => new Dictionary<string, Value>(),
+                        _ => throw new CypherRuntimeException($"Expected a map, got {src.Kind}"),
+                    };
+                    if (item.Kind == SetKind.ReplaceMap)
+                    {
+                        var existing = PropsOf(ctx, target);
+                        if (existing != null)
+                        {
+                            var keys = existing.Keys.ToArray();
+                            foreach (var k in keys)
+                                if (!map.ContainsKey(store.PropKeys.Name(k))) SetProp(ctx, target, k, Value.Null);
+                        }
+                    }
+                    foreach (var kv in map)
+                    {
+                        if (kv.Value.IsNull)
+                        {
+                            int k = store.PropKeys.Lookup(kv.Key);
+                            if (k >= 0) SetProp(ctx, target, k, Value.Null);
+                        }
+                        else SetProp(ctx, target, store.PropKeys.GetOrCreate(kv.Key), kv.Value);
+                    }
+                    break;
+                }
+            case SetKind.Labels:
+                {
+                    if (target.Kind != ValueKind.Node) throw new CypherRuntimeException("Labels can only be set on nodes");
+                    CheckEntity(ctx, target);
+                    foreach (var l in item.Labels!)
+                        if (store.AddLabel(target.EntityId, l.GetOrCreate(store), ctx.WriteLog)) ctx.Stats.LabelsAdded++;
+                    break;
+                }
+        }
+    }
+
+    public static void ApplyRemove(ExecContext ctx, CompiledSetItem item)
+    {
+        var target = item.Target(ctx);
+        if (target.IsNull) return;
+        var store = ctx.Store;
+        if (item.Kind == SetKind.Labels)
+        {
+            if (target.Kind != ValueKind.Node) throw new CypherRuntimeException("Labels can only be removed from nodes");
+            if (!store.NodeAlive(target.EntityId)) return;
+            foreach (var l in item.Labels!)
+            {
+                int id = l.Resolve(store);
+                if (id >= 0 && store.RemoveLabel(target.EntityId, id, ctx.WriteLog)) ctx.Stats.LabelsRemoved++;
+            }
+            return;
+        }
+        if (target.Kind is not (ValueKind.Node or ValueKind.Relationship))
+            throw new CypherRuntimeException($"REMOVE requires a node or relationship, got {target.Kind}");
+        int key = item.Key!.Resolve(store);
+        if (key < 0) return;
+        if (target.Kind == ValueKind.Node && !store.NodeAlive(target.EntityId)) return;
+        if (target.Kind == ValueKind.Relationship && !store.RelAlive(target.EntityId)) return;
+        var props = PropsOf(ctx, target);
+        if (props is null || !props.TryGet(key, out _)) return;
+        SetProp(ctx, target, key, Value.Null);
+    }
+
+    public static void Delete(ExecContext ctx, in Value v, bool detach)
+    {
+        var store = ctx.Store;
+        var log = ctx.WriteLog;
+        switch (v.Kind)
+        {
+            case ValueKind.Null: return;
+            case ValueKind.Relationship:
+                if (store.RelAlive(v.EntityId))
+                {
+                    store.DeleteRel(v.EntityId, log);
+                    ctx.Stats.RelationshipsDeleted++;
+                }
+                return;
+            case ValueKind.Node:
+                {
+                    int id = v.EntityId;
+                    if (!store.NodeAlive(id)) return;
+                    ref var n = ref store.Nodes[id];
+                    if (detach)
+                    {
+                        var rels = new List<int>(n.Out.Count + n.In.Count);
+                        foreach (var e in n.Out.Span) rels.Add(e.Rel);
+                        foreach (var e in n.In.Span) rels.Add(e.Rel);
+                        foreach (var r in rels)
+                        {
+                            if (!store.RelAlive(r)) continue;
+                            store.DeleteRel(r, log);
+                            ctx.Stats.RelationshipsDeleted++;
+                        }
+                    }
+                    else if (n.Out.Count > 0 || n.In.Count > 0)
+                    {
+                        (ctx.PendingNodeDeletes ??= new HashSet<int>()).Add(id);
+                    }
+                    store.DeleteNode(id, log);
+                    ctx.Stats.NodesDeleted++;
+                    return;
+                }
+            case ValueKind.Path:
+                {
+                    var p = (GraphPath)v.Obj!;
+                    foreach (var r in p.RelIds) Delete(ctx, Value.FromRelId(r), false);
+                    foreach (var n in p.NodeIds) Delete(ctx, Value.FromNodeId(n), detach);
+                    return;
+                }
+            case ValueKind.List:
+                foreach (var x in v.ListItems) Delete(ctx, x, detach);
+                return;
+            default:
+                throw new CypherRuntimeException($"DELETE expects a node, relationship or path, got {v.Kind}");
+        }
+    }
+}
+
+internal sealed class CreateOp(Operator input, CreateSpec spec) : UnaryOperator(input)
+{
+    public override string Name => "Create";
+    public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, spec);
+
+    private sealed class C(Cursor input, ExecContext ctx, CreateSpec spec) : Cursor
+    {
+        public override bool Next()
+        {
+            if (!input.Next()) return false;
+            spec.Execute(ctx);
+            return true;
+        }
+    }
+}
+
+internal sealed class MergeOp(Operator input, Operator match, CreateSpec create, CompiledSetItem[] onCreate, CompiledSetItem[] onMatch)
+    : UnaryOperator(input)
+{
+    private readonly Operator match = match;
+    private readonly CreateSpec create = create;
+    private readonly CompiledSetItem[] onCreate = onCreate;
+    private readonly CompiledSetItem[] onMatch = onMatch;
+    public override string Name => "Merge";
+    public override IEnumerable<Operator> Children => [Input, match];
+    public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
+
+    private sealed class C(MergeOp op, Cursor input, ExecContext ctx) : Cursor
+    {
+        private Cursor? _match;
+
+        public override bool Next()
+        {
+            while (true)
+            {
+                if (_match != null)
+                {
+                    if (_match.Next())
+                    {
+                        foreach (var s in op.onMatch) Mutations.ApplySet(ctx, s);
+                        return true;
+                    }
+                    _match = null;
+                }
+                if (!input.Next()) return false;
+                var m = op.match.Open(ctx);
+                if (m.Next())
+                {
+                    foreach (var s in op.onMatch) Mutations.ApplySet(ctx, s);
+                    _match = m;
+                    return true;
+                }
+                op.create.Execute(ctx);
+                foreach (var s in op.onCreate) Mutations.ApplySet(ctx, s);
+                return true;
+            }
+        }
+    }
+}
+
+internal sealed class SetOp(Operator input, CompiledSetItem[] items, bool remove) : UnaryOperator(input)
+{
+    public override string Name => remove ? "Remove" : "SetProperties";
+    public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, items, remove);
+
+    private sealed class C(Cursor input, ExecContext ctx, CompiledSetItem[] items, bool remove) : Cursor
+    {
+        public override bool Next()
+        {
+            if (!input.Next()) return false;
+            foreach (var it in items)
+            {
+                if (remove) Mutations.ApplyRemove(ctx, it);
+                else Mutations.ApplySet(ctx, it);
+            }
+            return true;
+        }
+    }
+}
+
+internal sealed class DeleteOp(Operator input, Eval[] exprs, bool detach) : UnaryOperator(input)
+{
+    public override string Name => detach ? "DetachDelete" : "Delete";
+    public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, exprs, detach);
+
+    private sealed class C(Cursor input, ExecContext ctx, Eval[] exprs, bool detach) : Cursor
+    {
+        public override bool Next()
+        {
+            if (!input.Next()) return false;
+            foreach (var e in exprs) Mutations.Delete(ctx, e(ctx), detach);
+            return true;
+        }
+    }
+}
+
+internal sealed class ForeachOp(Operator input, int slot, Eval list, Operator body) : UnaryOperator(input)
+{
+    public override string Name => "Foreach";
+    public override IEnumerable<Operator> Children => [Input, body];
+    public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slot, list, body);
+
+    private sealed class C(Cursor input, ExecContext ctx, int slot, Eval list, Operator body) : Cursor
+    {
+        public override bool Next()
+        {
+            if (!input.Next()) return false;
+            var v = list(ctx);
+            if (v.IsNull) return true;
+            var saved = RowOps.Snapshot(ctx.Row);
+            var items = v.Kind == ValueKind.List ? v.ListItems : [v];
+            foreach (var item in items)
+            {
+                ctx.Row[slot] = item;
+                var c = body.Open(ctx);
+                while (c.Next()) { }
+                RowOps.Restore(saved, ctx.Row);
+            }
+            return true;
+        }
+    }
+}
