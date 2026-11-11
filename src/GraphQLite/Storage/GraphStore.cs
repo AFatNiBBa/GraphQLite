@@ -142,7 +142,7 @@ internal sealed unsafe class GraphStore : IDisposable
         tx.LoadTokens();
     }
 
-    public StoreTx BeginRead() => new(this, null, Pager.CommittedSeq);
+    public StoreTx BeginRead() => new(this, null, Pager.VisibleSeq);
 
     /// <summary>Caller holds the writer gate.</summary>
     public StoreTx BeginWrite() => new(this, new WriteTx(Pager), long.MaxValue);
@@ -150,7 +150,7 @@ internal sealed unsafe class GraphStore : IDisposable
     /// <summary>Optimistic writer on the current snapshot: needs no gate until it commits.</summary>
     public StoreTx BeginConcurrentWrite()
     {
-        long seq = Pager.CommittedSeq;
+        long seq = Pager.VisibleSeq; // its rows reach the client before it commits: only durable data
         return new(this, new WriteTx(Pager, seq), seq) { ReservedNodes = new(), ReservedRels = new() };
     }
 

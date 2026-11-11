@@ -25,6 +25,8 @@ public sealed class QueryCursor : IDisposable
     private State _state;
     private Value[]? _current;
     internal readonly StatementLog? Log;
+    /// <summary>False when the rows reach the caller only after the transaction committed (auto-commit Execute).</summary>
+    internal bool ExposesRows = true;
 
     private enum State : byte { Open, Done, Failed, Closed }
 
@@ -87,7 +89,11 @@ public sealed class QueryCursor : IDisposable
     {
         if (_buffer != null)
         {
-            if (_buffer.TryDequeue(out var b)) return b;
+            if (_buffer.TryDequeue(out var b))
+            {
+                if (ExposesRows) _tx.BeforeExposingRows();
+                return b;
+            }
             if (_pendingError != null)
             {
                 var e = _pendingError;
@@ -109,6 +115,7 @@ public sealed class QueryCursor : IDisposable
                 var r = new Value[slots.Length];
                 for (int i = 0; i < slots.Length; i++) r[i] = _mat!.Convert(row[slots[i]]);
                 Log?.AddRow(r);
+                if (ExposesRows) _tx.BeforeExposingRows();
                 return r;
             }
             Complete();

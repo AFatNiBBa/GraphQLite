@@ -7,12 +7,13 @@ namespace GraphQLite;
 /// <summary>Durability of commits (same meaning as SQLite's PRAGMA synchronous in WAL mode).</summary>
 public enum SyncMode
 {
-    /// <summary>The WAL is not flushed on commit: fastest, recent commits may be lost if the process crashes.</summary>
+    /// <summary>Same as <see cref="Normal"/> (the WAL is written straight to the OS): kept for compatibility.</summary>
     Off,
-    /// <summary>The WAL is flushed to the OS on commit: survives process crashes; a power loss may lose recent commits
+    /// <summary>The WAL is written to the OS on commit: survives process crashes; a power loss may lose recent commits
     /// but never corrupts the database (data files are only written after the WAL is fsync'ed).</summary>
     Normal,
-    /// <summary>The WAL is fsync'ed on every commit: committed transactions survive power loss.</summary>
+    /// <summary>A commit returns once the WAL is fsync'ed: committed transactions survive power loss. Commits that
+    /// arrive together share one fsync (group commit), and other transactions see a commit only once it is durable.</summary>
     Full,
 }
 

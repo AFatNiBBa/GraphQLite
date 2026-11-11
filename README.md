@@ -42,14 +42,15 @@ using (var cursor = db.Stream("MATCH (p:Person) RETURN p.name AS name"))  // rig
 | `tests/GraphQLite.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità, server Bolt con il driver ufficiale Neo4j |
 | `tools/GraphQLite.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphQLite.Shell -- mydb`) |
 | `tools/GraphQLite.Bench` | benchmark (`dotnet run -c Release --project tools/GraphQLite.Bench -- 200000 5 [directory]`) |
+| `tools/GraphQLite.Compare` | confronto con Neo4j sulle stesse query: GraphQLite in-process, qualsiasi server Bolt, e (in `neo4j-embedded/`) Neo4j embedded in Java |
 
 ```
 dotnet build GraphQLite.slnx
 dotnet test  GraphQLite.slnx
 ```
 
-I test del server usano il pacchetto `Neo4j.Driver` (solo nel progetto di test: la libreria e il server non hanno
-dipendenze esterne).
+I test del server e `tools/GraphQLite.Compare` usano il pacchetto `Neo4j.Driver`: la libreria e il server non hanno
+dipendenze esterne.
 
 ## Storage (grafo più grande della RAM)
 
@@ -107,7 +108,9 @@ Un database è una **directory**:
 - `SyncMode`: `Off`, `Normal` (default) oppure `Full`:
   - con `Normal` il commit fa flush verso il sistema operativo. Dopo un power loss si possono perdere gli ultimi commit,
     ma il database non si corrompe, perché i file dati vengono scritti solo dopo il fsync del WAL;
-  - con `Full` ogni commit fa fsync.
+  - con `Full` un commit ritorna solo dopo il fsync del WAL. I commit che arrivano insieme condividono un solo fsync
+    (**group commit**: gli scrittori accodano i frame in memoria e il primo che aspetta li scrive e sincronizza tutti),
+    e gli altri vedono un commit solo quando è durevole.
 - **Atomicità per statement**: una query che fallisce dentro una transazione esplicita viene annullata da sola, e la
   transazione resta utilizzabile.
 - `CALL { … } IN TRANSACTIONS OF n ROWS` committa a lotti, così si importano dataset enormi senza tenere tutto in memoria.
@@ -223,6 +226,34 @@ e l'altra):
 Attraverso il server Bolt, con il driver ufficiale .NET sulla stessa macchina: ~14 k query/s con un client e
 ~115 k query/s con 32 client (lookup e 2-hop). Il limite è il costo del protocollo e del driver: durante la misura il
 server usa circa il 10% della CPU.
+
+### Confronto con Neo4j
+
+Misurato con `tools/GraphQLite.Compare` contro Neo4j 2026.02.2 Enterprise (istanza di Neo4j Desktop con la memoria di
+default, e lo stesso Neo4j embedded in Java), stessi dati e stesse query, tutto su disco, sulla stessa macchina
+(i7-13700, 24 thread). Per gli update i due database fanno fsync a ogni commit (`SyncMode.Full`).
+
+| Operazione | GraphQLite in-process | Neo4j embedded | GraphQLite.Server | Neo4j server |
+|---|---|---|---|---|
+| lookup su indice unique, 1 client | ~780 k/s | ~40 k/s | ~3,6–8 k/s | ~1 k/s |
+| lookup, molti client (24 / 32) | ~3,1 M/s | ~38 k/s | ~25–53 k/s | ~6,5 k/s |
+| 2-hop, 1 client | ~127 k/s | ~32 k/s | ~3,2 k/s | ~1 k/s |
+| 2-hop, molti client | ~750 k/s | ~35 k/s | ~22–24 k/s | ~6,4 k/s |
+| `shortestPath` | ~19 k/s | ~11 k/s | ~2,7 k/s | ~0,8 k/s |
+| scan per label + group by | 5,7 ms | 18 ms | 4,4 ms | 40 ms |
+| espansione di 1M relazioni + filtro | 33 ms | 110 ms | 18–20 ms | 257 ms |
+| grado entrante + top-5 (200k gruppi) | 174 ms | **117 ms** | 84–139 ms | 268 ms |
+| update con fsync, 1 client | ~1,8 k/s | ~1,1 k/s | ~1,0 k/s | ~0,5 k/s |
+| update con fsync, molti client | ~13,5–15,5 k/s | ~11–15,5 k/s | ~11,7 k/s | ~5,6 k/s |
+
+- Nelle letture di Neo4j embedded il throughput non cresce con i thread (anche con Community): la causa non è stata
+  indagata, quindi il divario con molti client va preso con cautela.
+- Via Bolt il costo fisso di ogni query pesa di più: un `RETURN 1` costa ~0,28 ms con GraphQLite.Server e ~1,07 ms con
+  Neo4j, con lo stesso driver.
+- Il runtime parallelo di Neo4j Enterprise (`CYPHER runtime=parallel`) migliora le query analitiche via server del
+  10–40%, senza cambiare il quadro.
+- Neo4j resta più veloce sull'aggregazione con molti gruppi in-process (117 ms contro 118–174 ms), e con il group
+  commit gli update con fsync e molti client in-process sono alla pari.
 
 ## openCypher supportato
 

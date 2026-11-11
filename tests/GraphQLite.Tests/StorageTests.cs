@@ -149,12 +149,13 @@ public class StorageTests : IDisposable
     }
 
     [Fact]
-    public async Task RwLock_Never_Lets_A_Writer_In_With_Readers_Inside()
+    public void RwLock_Never_Lets_A_Writer_In_With_Readers_Inside()
     {
         using var rw = new RwLock();
         int inside = 0, writes = 0, violations = 0;
         bool stop = false;
-        var readers = Enumerable.Range(0, Math.Max(4, Environment.ProcessorCount)).Select(t => Task.Run(() =>
+        // dedicated threads, not the thread pool: spinning pool threads would starve the tests running in parallel
+        var readers = Enumerable.Range(0, Math.Max(4, Environment.ProcessorCount / 2)).Select(t => new Thread(() =>
         {
             var rnd = new Random(t);
             while (!Volatile.Read(ref stop))
@@ -165,27 +166,79 @@ public class StorageTests : IDisposable
                 Interlocked.Decrement(ref inside);
                 rw.ExitRead();
             }
-        })).ToArray();
-        var writer = Task.Run(() =>
+        }) { IsBackground = true }).ToArray();
+        foreach (var r in readers) r.Start();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 1500)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < 1500)
-            {
-                bool entered = writes % 2 == 0 ? rw.TryEnterWrite(5) : Enter();
-                if (!entered) continue;
-                if (Volatile.Read(ref inside) != 0) Interlocked.Increment(ref violations);
-                Thread.SpinWait(200);
-                if (Volatile.Read(ref inside) != 0) Interlocked.Increment(ref violations);
-                writes++;
-                rw.ExitWrite();
-            }
-        });
+            bool entered = writes % 2 == 0 ? rw.TryEnterWrite(5) : Enter();
+            if (!entered) continue;
+            if (Volatile.Read(ref inside) != 0) violations++;
+            Thread.SpinWait(200);
+            if (Volatile.Read(ref inside) != 0) violations++;
+            writes++;
+            rw.ExitWrite();
+        }
         bool Enter() { rw.EnterWrite(); return true; }
-        await writer;
         Volatile.Write(ref stop, true);
-        await Task.WhenAll(readers);
+        foreach (var r in readers) r.Join();
         Assert.Equal(0, violations);
         Assert.True(writes > 10, $"only {writes} exclusive sections");
+    }
+
+    [Fact]
+    public async Task Group_Commit_Shares_Fsyncs_And_Loses_Nothing()
+    {
+        var opts = new DatabaseOptions { Sync = SyncMode.Full };
+        var db = GraphDatabase.Open(DbPath, opts);
+        db.Execute("CREATE CONSTRAINT FOR (c:C) REQUIRE c.id IS UNIQUE");
+        db.Execute("UNWIND range(0, 15) AS i CREATE (:C {id: i, v: 0})");
+        const int Threads = 16, PerThread = 150;
+        db.Store.Pager.BeforeGroupSync = () => Thread.Sleep(2); // a slow disk: commits pile up behind each fsync
+        long before = db.Store.Pager.GroupSyncs;
+        await Task.WhenAll(Enumerable.Range(0, Threads).Select(t => Task.Run(() =>
+        {
+            for (int i = 0; i < PerThread; i++)
+                db.Execute("MATCH (c:C {id: $id}) SET c.v = c.v + 1", new Dictionary<string, object?> { ["id"] = t });
+        })));
+        long syncs = db.Store.Pager.GroupSyncs - before;
+        db.Store.Pager.BeforeGroupSync = null;
+        Assert.True(syncs < Threads * PerThread / 2, $"{syncs} fsyncs for {Threads * PerThread} commits");
+        db.SimulateCrash(); // no checkpoint: everything comes back from the WAL
+        using (db = GraphDatabase.Open(DbPath, opts))
+            Assert.Equal(Enumerable.Repeat((long)PerThread, Threads), db.Execute("MATCH (c:C) RETURN c.v ORDER BY c.id").Select(r => r.Get<long>(0)));
+    }
+
+    [Fact]
+    public async Task Group_Commit_Hides_Commits_Until_They_Are_Durable()
+    {
+        using var db = GraphDatabase.Open(DbPath, new DatabaseOptions { Sync = SyncMode.Full });
+        db.Execute("CREATE (:Seed)");
+        using var inSync = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        db.Store.Pager.BeforeGroupSync = () => { inSync.Set(); release.Wait(); };
+
+        var writer = Task.Run(() => db.Execute("CREATE (:X {v: 1})"));
+        Assert.True(inSync.Wait(5000)); // the commit is written, its fsync is stuck
+        // a reader does not see it yet
+        Assert.Equal(0L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>());
+        // an exclusive transaction builds on it, but must not hand its rows out before it is durable
+        var reader = Task.Run(() =>
+        {
+            using var tx = db.BeginTransaction();
+            var r = tx.Execute("MATCH (x:X) RETURN x.v").Select(row => row.Get<long>(0)).ToList();
+            tx.Commit();
+            return r;
+        });
+        await Task.Delay(300);
+        Assert.False(writer.IsCompleted);
+        Assert.False(reader.IsCompleted);
+
+        db.Store.Pager.BeforeGroupSync = null;
+        release.Set();
+        await writer;
+        Assert.Equal([1L], await reader);
+        Assert.Equal(1L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>());
     }
 
     [Fact]

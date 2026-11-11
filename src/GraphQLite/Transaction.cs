@@ -24,6 +24,12 @@ public sealed class Transaction : IDisposable
     private QueryCursor? _open;
     /// <summary>Statements of a concurrent transaction, replayed if others committed in the meantime.</summary>
     private readonly List<StatementLog>? _log;
+    /// <summary>
+    /// Exclusive writers read the newest commits, which with SyncMode.Full may not be durable yet (group commit):
+    /// before showing a row to the caller they wait for the commits they read (up to this sequence) to be durable.
+    /// 0 when there is nothing to wait for.
+    /// </summary>
+    private long _exposeAfter;
 
     public bool IsReadOnly => !Store.IsWriter;
 
@@ -37,12 +43,23 @@ public sealed class Transaction : IDisposable
         _autoCommit = autoCommit;
         _concurrent = concurrent;
         if (concurrent) _log = new List<StatementLog>();
+        else if (store.IsWriter) _exposeAfter = db.Store.Pager.CommittedSeq; // under the writer gate
+    }
+
+    /// <summary>Called before a row reaches the caller (see <see cref="_exposeAfter"/>).</summary>
+    internal void BeforeExposingRows()
+    {
+        if (_exposeAfter == 0) return;
+        _db.Store.Pager.WaitDurable(_exposeAfter);
+        _exposeAfter = 0;
     }
 
     /// <summary>Executes a query and returns all its rows.</summary>
     public QueryResult Execute(string query, IReadOnlyDictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default)
     {
         using var cursor = Open(query, parameters, cancellationToken, ownsTransaction: false, null);
+        // an auto-commit query hands its rows over only after its own (durable) commit: no need to wait before
+        cursor.ExposesRows = !_autoCommit;
         var rows = new List<Value[]>();
         while (cursor.NextValues() is { } r) rows.Add(r);
         return new QueryResult(cursor.ColumnSet, rows, cursor.Statistics);
@@ -132,6 +149,9 @@ public sealed class Transaction : IDisposable
     private void CommitBatch()
     {
         Store.Commit();
+        // durable right away (under the gate): batches are large anyway, and if the query fails later its earlier
+        // batches must not stay committed but invisible
+        _db.Store.Pager.WaitDurable(_db.Store.Pager.CommittedSeq);
         _db.AfterCommit();
         Store.BeginStatement();
     }
@@ -185,19 +205,23 @@ public sealed class Transaction : IDisposable
             CommitConcurrent();
             return;
         }
+        long seq = -1;
         try
         {
             Store.Commit();
+            seq = _db.Store.Pager.CommittedSeq;
             _db.AfterCommit();
         }
         catch
         {
-            Store.Abort();
+            if (seq < 0) Store.Abort();
             throw;
         }
         finally
         {
             _db.WriterGate.Release();
+            // group commit: wait for the fsync outside the gate, so the next writers can join it
+            if (seq >= 0) _db.Store.Pager.WaitDurable(seq);
         }
     }
 
@@ -211,6 +235,7 @@ public sealed class Transaction : IDisposable
             return;
         }
         _db.WriterGate.Wait();
+        long seq = -1;
         try
         {
             if (_db.Store.Pager.CommittedSeq == Store.Snapshot)
@@ -230,11 +255,13 @@ public sealed class Transaction : IDisposable
                 Store.Abort();
                 Replay();
             }
+            seq = _db.Store.Pager.CommittedSeq;
             _db.AfterCommit();
         }
         finally
         {
             _db.WriterGate.Release();
+            if (seq >= 0) _db.Store.Pager.WaitDurable(seq);
         }
     }
 
@@ -244,7 +271,7 @@ public sealed class Transaction : IDisposable
         var store = _db.Store.BeginWrite();
         store.ReplayNodes = new Queue<long>(Store.ReservedNodes!);
         store.ReplayRels = new Queue<long>(Store.ReservedRels!);
-        var tx = new Transaction(_db, store, autoCommit: false);
+        var tx = new Transaction(_db, store, autoCommit: false) { _exposeAfter = 0 }; // its rows reach nobody
         try
         {
             foreach (var original in _log!)
