@@ -519,7 +519,8 @@ internal sealed unsafe class WriteTx
 /// </summary>
 internal sealed unsafe class Wal : IDisposable
 {
-    private const uint Magic = 0x334C4157; // "WAL3"
+    private const uint Magic = 0x344C4157;   // "WAL4": the CRC covers the whole header except itself
+    private const uint MagicV3 = 0x334C4157; // "WAL3": still replayed (its CRC did not cover the page count)
     private const int HeaderSize = 24;     // magic, page count, seq, crc, body length
     private const ushort FullPage = 0xFFFF;
     private const int MergeGap = 16;
@@ -608,10 +609,7 @@ internal sealed unsafe class Wal : IDisposable
         BinaryPrimitives.WriteInt32LittleEndian(header[4..], pages.Count);
         BinaryPrimitives.WriteInt64LittleEndian(header[8..], seq);
         BinaryPrimitives.WriteInt32LittleEndian(header[20..], w.Length);
-        uint crc = CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8));
-        crc = CrcStream.Update(crc, header.Slice(20, 4));
-        crc = CrcStream.Update(crc, w.Written);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[16..], ~crc);
+        BinaryPrimitives.WriteUInt32LittleEndian(header[16..], FrameCrc(header, w.Written, Magic));
         long pos = _fs.Position;
         try
         {
@@ -627,6 +625,16 @@ internal sealed unsafe class Wal : IDisposable
         if (w.Length > 1 << 22) _body.Reset();
     }
 
+    /// <summary>CRC32C of a frame: header fields after the magic (except the CRC itself) and body.</summary>
+    private static uint FrameCrc(ReadOnlySpan<byte> header, ReadOnlySpan<byte> body, uint magic)
+    {
+        uint crc = magic == MagicV3
+            ? CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8))
+            : CrcStream.Update(0xFFFFFFFFu, header.Slice(4, 12));
+        crc = CrcStream.Update(crc, header.Slice(20, 4));
+        return ~CrcStream.Update(crc, body);
+    }
+
     private static void BinaryPrimitivesWriteU16(BinWriter w, ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(w.Reserve(2), v);
 
     /// <summary>Replays valid frames; <paramref name="current"/> returns the latest image of a page (recovered so far or base).</summary>
@@ -640,7 +648,8 @@ internal sealed unsafe class Wal : IDisposable
         {
             _fs.Position = good;
             if (_fs.Read(header) != HeaderSize) break;
-            if (BinaryPrimitives.ReadUInt32LittleEndian(header) != Magic) break;
+            uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
+            if (magic != Magic && magic != MagicV3) break;
             int count = BinaryPrimitives.ReadInt32LittleEndian(header[4..]);
             long seq = BinaryPrimitives.ReadInt64LittleEndian(header[8..]);
             uint crc = BinaryPrimitives.ReadUInt32LittleEndian(header[16..]);
@@ -648,10 +657,8 @@ internal sealed unsafe class Wal : IDisposable
             if (count <= 0 || bodyLen < 0 || good + HeaderSize + bodyLen > len) break;
             if (body.Length < bodyLen) body = new byte[bodyLen];
             _fs.ReadExactly(body, 0, bodyLen);
-            uint state = CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8));
-            state = CrcStream.Update(state, header.Slice(20, 4));
-            state = CrcStream.Update(state, body.AsSpan(0, bodyLen));
-            if (~state != crc) break;
+            if (FrameCrc(header, body.AsSpan(0, bodyLen), magic) != crc) break;
+            if (!Validate(body.AsSpan(0, bodyLen), count)) break; // inconsistent frame: treated as a torn tail
             var pages = new List<(long, nint)>(count);
             int p = 0;
             for (int i = 0; i < count; i++)
@@ -688,6 +695,36 @@ internal sealed unsafe class Wal : IDisposable
             _fs.Flush(true);
         }
         _fs.Position = good;
+    }
+
+    /// <summary>Checks that a frame body holds exactly <paramref name="count"/> well-formed page records.</summary>
+    private static bool Validate(ReadOnlySpan<byte> body, int count)
+    {
+        int p = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (body.Length - p < 10) return false;
+            long key = BinaryPrimitives.ReadInt64LittleEndian(body[p..]);
+            ushort n = BinaryPrimitives.ReadUInt16LittleEndian(body[(p + 8)..]);
+            p += 10;
+            if (key < 0 || (key >> 56) > (long)Space.Rels) return false;
+            if (n == FullPage)
+            {
+                if (body.Length - p < Pages.Size) return false;
+                p += Pages.Size;
+                continue;
+            }
+            for (int k = 0; k < n; k++)
+            {
+                if (body.Length - p < 4) return false;
+                int off = BinaryPrimitives.ReadUInt16LittleEndian(body[p..]);
+                int l = BinaryPrimitives.ReadUInt16LittleEndian(body[(p + 2)..]);
+                p += 4;
+                if (off + l > Pages.Size || body.Length - p < l) return false;
+                p += l;
+            }
+        }
+        return p == body.Length;
     }
 
     public void Sync()

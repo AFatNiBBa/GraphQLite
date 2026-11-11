@@ -101,7 +101,8 @@ Un database è una **directory**:
   recenti nei file mappati, li sincronizza su disco e tronca il WAL. Esclude i lettori solo per il tempo della copia in
   memoria.
 - **WAL a delta**: per ogni pagina si registrano solo gli intervalli di byte cambiati (o l'immagine intera se è cambiata
-  più di metà pagina). I frame hanno CRC32C hardware. In recovery una coda troncata viene scartata. Il replay è
+  più di metà pagina). I frame hanno CRC32C hardware su intestazione e corpo. In recovery una coda troncata o
+  incoerente viene scartata. Il replay è
   idempotente byte per byte, quindi è corretto anche dopo un checkpoint interrotto a metà.
 - `SyncMode`: `Off`, `Normal` (default) oppure `Full`:
   - con `Normal` il commit fa flush verso il sistema operativo. Dopo un power loss si possono perdere gli ultimi commit,
@@ -195,7 +196,9 @@ Le tecniche principali:
   sola lettura; `DatabaseOptions.MaxDegreeOfParallelism` (default: numero di core, `1` la disattiva);
 - cache dei piani lock-free;
 - lookup delle pagine con tabelle sparse lock-free (due accessi ad array);
-- pool delle pagine da 8 KB: la copy-on-write non passa dall'heap nativo a ogni pagina toccata.
+- pool delle pagine da 8 KB: la copy-on-write non passa dall'heap nativo a ogni pagina toccata;
+- lettori contati su contatori separati per core (ognuno sulla sua cache line): le letture parallele non si contendono
+  una variabile condivisa (+20–30% di lookup a 24 thread rispetto a un contatore unico).
 
 Con le query parallele conviene il **Server GC** (`<ServerGarbageCollection>true</ServerGarbageCollection>` nel
 progetto dell'applicazione): le aggregazioni con molti gruppi allocano da più thread e con il GC workstation vanno

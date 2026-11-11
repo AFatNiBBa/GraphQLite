@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using GraphQLite.Storage;
+
 namespace GraphQLite.Tests;
 
 public class StorageTests : IDisposable
@@ -84,6 +87,105 @@ public class StorageTests : IDisposable
         }
         using (db = GraphDatabase.Open(DbPath))
             Assert.Equal(2, db.NodeCount);
+    }
+
+    /// <summary>Start offsets of the frames of the WAL (24-byte header, body length at offset 20).</summary>
+    private static List<int> WalFrames(byte[] wal)
+    {
+        var frames = new List<int>();
+        for (int p = 0; p + 24 <= wal.Length; p += 24 + BinaryPrimitives.ReadInt32LittleEndian(wal.AsSpan(p + 20))) frames.Add(p);
+        return frames;
+    }
+
+    [Fact]
+    public void Wal_Frame_With_A_Corrupted_Page_Count_Is_Discarded()
+    {
+        var db = GraphDatabase.Open(DbPath);
+        db.Execute("CREATE (:A)");
+        db.Execute("CREATE (:B)");
+        db.SimulateCrash();
+        var wal = File.ReadAllBytes(WalPath);
+        int last = WalFrames(wal)[^1];
+        wal[last + 4]++; // the page count is covered by the CRC
+        File.WriteAllBytes(WalPath, wal);
+        using (db = GraphDatabase.Open(DbPath))
+        {
+            Assert.Equal(1, db.NodeCount);
+            Assert.Equal(1L, db.Execute("MATCH (a:A) RETURN count(a)").Scalar<long>());
+        }
+    }
+
+    [Fact]
+    public void Wal3_Frames_Are_Still_Replayed()
+    {
+        var db = GraphDatabase.Open(DbPath);
+        db.Execute("CREATE (:A)");
+        db.Execute("CREATE (:B)");
+        db.Execute("CREATE (:C)");
+        db.SimulateCrash();
+        // rewrite every frame in the previous format: magic "WAL3", CRC over seq, body length and body
+        var wal = File.ReadAllBytes(WalPath);
+        var frames = WalFrames(wal);
+        foreach (int f in frames)
+        {
+            var header = wal.AsSpan(f, 24);
+            BinaryPrimitives.WriteUInt32LittleEndian(header, 0x334C4157);
+            uint crc = CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8));
+            crc = CrcStream.Update(crc, header.Slice(20, 4));
+            crc = CrcStream.Update(crc, wal.AsSpan(f + 24, BinaryPrimitives.ReadInt32LittleEndian(header[20..])));
+            BinaryPrimitives.WriteUInt32LittleEndian(header[16..], ~crc);
+        }
+        // in WAL3 the page count is not checksummed: a wrong one must be caught by the body validation
+        wal[frames[^1] + 4]++;
+        File.WriteAllBytes(WalPath, wal);
+        using (db = GraphDatabase.Open(DbPath))
+        {
+            Assert.Equal(2, db.NodeCount);
+            Assert.Equal(["A", "B"], db.Execute("MATCH (n) RETURN labels(n)[0] ORDER BY labels(n)[0]").Select(r => r.Get<string>(0)));
+            db.Execute("CREATE (:D)");
+        }
+        using (db = GraphDatabase.Open(DbPath))
+            Assert.Equal(3, db.NodeCount);
+    }
+
+    [Fact]
+    public async Task RwLock_Never_Lets_A_Writer_In_With_Readers_Inside()
+    {
+        using var rw = new RwLock();
+        int inside = 0, writes = 0, violations = 0;
+        bool stop = false;
+        var readers = Enumerable.Range(0, Math.Max(4, Environment.ProcessorCount)).Select(t => Task.Run(() =>
+        {
+            var rnd = new Random(t);
+            while (!Volatile.Read(ref stop))
+            {
+                rw.EnterRead();
+                Interlocked.Increment(ref inside);
+                if (rnd.Next(4) == 0) Thread.Yield(); // may resume on another core: exit decrements another counter
+                Interlocked.Decrement(ref inside);
+                rw.ExitRead();
+            }
+        })).ToArray();
+        var writer = Task.Run(() =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 1500)
+            {
+                bool entered = writes % 2 == 0 ? rw.TryEnterWrite(5) : Enter();
+                if (!entered) continue;
+                if (Volatile.Read(ref inside) != 0) Interlocked.Increment(ref violations);
+                Thread.SpinWait(200);
+                if (Volatile.Read(ref inside) != 0) Interlocked.Increment(ref violations);
+                writes++;
+                rw.ExitWrite();
+            }
+        });
+        bool Enter() { rw.EnterWrite(); return true; }
+        await writer;
+        Volatile.Write(ref stop, true);
+        await Task.WhenAll(readers);
+        Assert.Equal(0, violations);
+        Assert.True(writes > 10, $"only {writes} exclusive sections");
     }
 
     [Fact]
