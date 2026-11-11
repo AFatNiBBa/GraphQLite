@@ -353,6 +353,36 @@ public class FeatureTests : IDisposable
         Assert.Equal(12497500L, Q("MATCH (r:Row) RETURN sum(r.n)").Scalar<long>());
     }
 
+    // ------------------------------------------------------------------ nested property paths
+
+    [Fact]
+    public void Set_And_Remove_Nested_Property_Paths()
+    {
+        Q("CREATE (:Test {ciao: {a: 0}}), (:Test)");
+        Q("MATCH (x:Test) SET x.ciao.beppe = [ { alfa: 1 }, 41 ]");
+        var maps = Q("MATCH (x:Test) RETURN x.ciao AS c ORDER BY size(keys(x.ciao))").Select(r => r["c"].AsMap()).ToList();
+        Assert.Equal(["beppe"], maps[0].Keys);                    // created from nothing
+        Assert.Equal(["a", "beppe"], maps[1].Keys.Order());       // merged into the existing map
+        Assert.Equal(41L, maps[1]["beppe"].AsList()[1].AsInt64());
+        Assert.Equal(1L, Q("MATCH (x:Test) RETURN x.ciao.beppe[0].alfa AS v LIMIT 1").Scalar<long>());
+
+        var s = Q("MATCH (x:Test) WHERE x.ciao.a = 0 SET x.ciao.deep.er.est = 'ok', x.ciao.a = null").Statistics;
+        Assert.Equal(2, s.PropertiesSet);
+        var m = Q("MATCH (x:Test) WHERE x.ciao.deep IS NOT NULL RETURN x.ciao AS c").Single()["c"].AsMap();
+        Assert.Equal(["beppe", "deep"], m.Keys.Order());
+        Assert.Equal("ok", m["deep"].AsMap()["er"].AsMap()["est"].AsString());
+
+        Q("MATCH (x:Test) REMOVE x.ciao.beppe");
+        Assert.Equal(0, Q("MATCH (x:Test) WHERE x.ciao.beppe IS NOT NULL RETURN count(*)").Scalar<long>());
+        Assert.Equal(0, Q("MATCH (x:Test) REMOVE x.nothing.here RETURN count(*)").Statistics.PropertiesSet);
+
+        Q("CREATE (:Num {v: 5})");
+        Assert.Throws<CypherRuntimeException>(() => Q("MATCH (n:Num) SET n.v.x = 1"));
+        Q("CREATE (a:A)-[:R {meta: {}}]->(:B)");
+        Q("MATCH ()-[r:R]->() SET r.meta.weight = 2.5, r.meta.tags = ['x']");
+        Assert.Equal(2.5, Q("MATCH ()-[r:R]->() RETURN r.meta.weight").Scalar<double>());
+    }
+
     // ------------------------------------------------------------------ procedures
 
     [Fact]

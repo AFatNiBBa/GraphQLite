@@ -49,13 +49,15 @@ internal sealed class CreateSpec(CreateNodeSpec[] nodes, CreateRelSpec[] rels, P
     }
 }
 
-internal sealed class CompiledSetItem(SetKind kind, Eval target, TokenRef? key, Eval? value, TokenRef[]? labels)
+internal sealed class CompiledSetItem(SetKind kind, Eval target, TokenRef? key, Eval? value, TokenRef[]? labels, string[]? subPath = null)
 {
     public readonly SetKind Kind = kind;
     public readonly Eval Target = target;
     public readonly TokenRef? Key = key;
     public readonly Eval? Value = value;
     public readonly TokenRef[]? Labels = labels;
+    /// <summary>Keys inside the map stored in property <see cref="Key"/> (<c>SET n.a.b.c = v</c>: Key = a, SubPath = [b, c]).</summary>
+    public readonly string[]? SubPath = subPath;
 }
 
 internal static class Mutations
@@ -105,6 +107,11 @@ internal static class Mutations
                         throw new CypherRuntimeException($"SET requires a node or relationship, got {target.Kind}");
                     CheckEntity(ctx, target);
                     var v = item.Value!(ctx);
+                    if (item.SubPath is { Length: > 0 })
+                    {
+                        SetNested(ctx, target, item, v);
+                        break;
+                    }
                     if (v.IsNull)
                     {
                         int k = item.Key!.Resolve(store);
@@ -177,9 +184,63 @@ internal static class Mutations
         if (key < 0) return;
         if (target.Kind == ValueKind.Node && !store.NodeAlive(target.EntityId)) return;
         if (target.Kind == ValueKind.Relationship && !store.RelAlive(target.EntityId)) return;
+        if (item.SubPath is { Length: > 0 })
+        {
+            SetNested(ctx, target, item, Value.Null);
+            return;
+        }
         var cur = target.Kind == ValueKind.Node ? store.NodeProp(target.EntityId, key) : store.RelProp(target.EntityId, key);
         if (cur.IsNull) return;
         SetProp(ctx, target, key, Value.Null);
+    }
+
+    /// <summary>
+    /// <c>SET n.a.b.c = v</c> / <c>REMOVE n.a.b.c</c>: rebuilds the maps along the path inside property <c>a</c>.
+    /// Missing maps are created; null removes the key (and leaves the property untouched if the path does not exist).
+    /// </summary>
+    private static void SetNested(ExecContext ctx, in Value target, CompiledSetItem item, Value v)
+    {
+        var store = ctx.Store;
+        int key = v.IsNull ? item.Key!.Resolve(store) : item.Key!.GetOrCreate(store);
+        if (key < 0) return;
+        var cur = target.Kind == ValueKind.Node ? store.NodeProp(target.EntityId, key) : store.RelProp(target.EntityId, key);
+        if (v.IsNull && cur.IsNull) return;
+        var updated = SetIn(cur, item.SubPath!, 0, v, out bool changed);
+        if (changed) SetProp(ctx, target, key, updated);
+    }
+
+    private static Value SetIn(in Value cur, string[] path, int i, in Value v, out bool changed)
+    {
+        if (i == path.Length)
+        {
+            changed = true;
+            return v;
+        }
+        if (cur.IsNull)
+        {
+            if (v.IsNull)
+            {
+                changed = false;
+                return cur;
+            }
+        }
+        else if (cur.Kind != ValueKind.Map)
+        {
+            throw new CypherRuntimeException($"Cannot set key '{path[i]}' of a {cur.Kind.ToString().ToLowerInvariant()}: only maps have keys");
+        }
+        var map = cur.IsNull ? new Dictionary<string, Value>() : new Dictionary<string, Value>(cur.MapItems);
+        var child = SetIn(map.GetValueOrDefault(path[i]), path, i + 1, v, out changed);
+        if (!changed) return cur;
+        if (child.IsNull)
+        {
+            if (!map.Remove(path[i]))
+            {
+                changed = false;
+                return cur;
+            }
+        }
+        else map[path[i]] = child;
+        return Value.FromMap(map);
     }
 
     public static void Delete(ExecContext ctx, in Value v, bool detach)

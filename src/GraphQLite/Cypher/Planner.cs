@@ -1018,6 +1018,20 @@ internal sealed partial class Planner
 
     private CompiledSetItem CompileSetItem(SetItem it, Dictionary<string, int> scope)
     {
+        if (it.Kind == SetKind.Property && it.Target is PropertyExpr)
+        {
+            // n.a.b.c: nested maps are allowed as property values, so this updates key path [b, c] of property a
+            var keys = new List<string> { it.Key! };
+            var root = it.Target;
+            while (root is PropertyExpr pe)
+            {
+                keys.Add(pe.Key);
+                root = pe.Target;
+            }
+            keys.Reverse();
+            return new CompiledSetItem(it.Kind, Compile(root, scope), new TokenRef(keys[0], TokenKind.PropKey),
+                it.Value is null ? null : Compile(it.Value, scope), null, keys.Skip(1).ToArray());
+        }
         var target = Compile(it.Target, scope);
         return it.Kind switch
         {

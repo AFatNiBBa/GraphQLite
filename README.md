@@ -252,7 +252,9 @@ server usa circa il 10% della CPU.
 **Tipi di valore** (anche come proprietà):
 - null, booleani, interi a 64 bit, float, stringhe;
 - **liste e mappe annidate a piacere** (campi JSON). Neo4j accetta solo array di primitivi, ma è una scelta di design
-  e non un vincolo di prestazioni, quindi qui sono permessi;
+  e non un vincolo di prestazioni, quindi qui sono permessi. Si possono anche modificare per percorso:
+  `SET n.doc.address.city = 'Roma'` aggiorna solo quella chiave (le mappe intermedie mancanti vengono create),
+  `SET n.doc.tmp = null` e `REMOVE n.doc.tmp` la tolgono;
 - **`date`, `localtime`, `time`, `localdatetime`, `datetime`** (con offset o fuso IANA), **`duration`**;
 - **`point`** (cartesiano 2D/3D, WGS-84).
 

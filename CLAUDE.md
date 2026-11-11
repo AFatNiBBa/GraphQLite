@@ -68,7 +68,7 @@ Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'
 - `Path` collide con `System.IO.Path`: il tipo dei percorsi si chiama `GraphPath`, ma il membro dell'enum resta `ValueKind.Path`
 
 ## Scelte volute (non segnalarle come problemi)
-- Mappe e liste annidate sono ammesse come proprietà (al contrario di Neo4j): la restrizione di Neo4j è ideologica, non di prestazioni, e l'utente le ha chieste esplicitamente
+- Mappe e liste annidate sono ammesse come proprietà (al contrario di Neo4j): la restrizione di Neo4j è ideologica, non di prestazioni, e l'utente le ha chieste esplicitamente. Di conseguenza `SET n.a.b.c = v` / `REMOVE n.a.b.c` modificano un percorso dentro la mappa della proprietà `a` (`CompiledSetItem.SubPath`, `Mutations.SetNested`): estensione nostra, Neo4j la rifiuta
 - Un solo processo per database (la directory è aperta in esclusiva): il supporto multi-processo richiederebbe un indice delle versioni in shared memory, come il `-shm` di SQLite
 - Date limitate agli anni 1–9999 e precisione di 100 ns (tick .NET)
 - Supporto a 32 bit gradito ma non necessario: funziona finché i file stanno nello spazio di indirizzamento
