@@ -104,8 +104,76 @@ internal static partial class SystemQueries
             }
             return new Result(cols, rows);
         }
+
+        if (lower.StartsWith("call dbms.info()", StringComparison.Ordinal))
+            return Rows(["id", "name", "creationDate"], [S("graphqlite"), S(o.DatabaseName), S("")]);
+
+        if (ShowSchema().Match(q) is { Success: true } sm)
+        {
+            string type = sm.Groups["type"].Success ? sm.Groups["type"].Value.ToUpperInvariant() : "ALL";
+            string? yield = sm.Groups["yield"].Success ? sm.Groups["yield"].Value : null;
+            bool indexes = sm.Groups["what"].Value.StartsWith("index", StringComparison.OrdinalIgnoreCase);
+            var rows = new List<Dictionary<string, Value>>();
+            using (var tx = server.Database.BeginReadTransaction())
+            {
+                var st = tx.Store;
+                long id = 1;
+                foreach (var ix in st.Catalog.Indexes.OrderBy(i => i.Name, StringComparer.Ordinal))
+                {
+                    var label = L(S(st.Labels.Name(ix.Label)));
+                    var prop = L(S(st.PropKeys.Name(ix.Key)));
+                    string constraint = ix.Unique ? ix.Name : "";
+                    if (indexes && type is "ALL" or "RANGE")
+                    {
+                        rows.Add(new()
+                        {
+                            ["id"] = Value.FromInt(id), ["name"] = S(ix.Name), ["state"] = S("ONLINE"), ["populationPercent"] = Value.FromFloat(100),
+                            ["type"] = S("RANGE"), ["entityType"] = S("NODE"), ["labelsOrTypes"] = label, ["properties"] = prop,
+                            ["indexProvider"] = S("range-1.0"), ["owningConstraint"] = ix.Unique ? S(constraint) : Value.Null,
+                            ["lastRead"] = Value.Null, ["readCount"] = Value.FromInt(0), ["trackedSince"] = Value.Null,
+                            ["options"] = Value.FromMap(new()), ["failureMessage"] = S(""),
+                            ["createStatement"] = S(ix.Unique
+                                ? $"CREATE CONSTRAINT `{ix.Name}` FOR (n:`{st.Labels.Name(ix.Label)}`) REQUIRE (n.`{st.PropKeys.Name(ix.Key)}`) IS UNIQUE"
+                                : $"CREATE RANGE INDEX `{ix.Name}` FOR (n:`{st.Labels.Name(ix.Label)}`) ON (n.`{st.PropKeys.Name(ix.Key)}`)"),
+                        });
+                    }
+                    else if (!indexes && ix.Unique && type is "ALL" or "UNIQUE" or "NODE UNIQUE" or "UNIQUENESS" or "NODE UNIQUENESS")
+                    {
+                        rows.Add(new()
+                        {
+                            ["id"] = Value.FromInt(id), ["name"] = S(ix.Name), ["type"] = S("UNIQUENESS"), ["entityType"] = S("NODE"),
+                            ["labelsOrTypes"] = label, ["properties"] = prop, ["ownedIndex"] = S(ix.Name), ["propertyType"] = Value.Null,
+                            ["options"] = Value.FromMap(new()),
+                            ["createStatement"] = S($"CREATE CONSTRAINT `{ix.Name}` FOR (n:`{st.Labels.Name(ix.Label)}`) REQUIRE (n.`{st.PropKeys.Name(ix.Key)}`) IS UNIQUE"),
+                        });
+                    }
+                    id++;
+                }
+            }
+            string[] defaults = indexes
+                ? ["id", "name", "state", "populationPercent", "type", "entityType", "labelsOrTypes", "properties", "indexProvider", "owningConstraint", "lastRead", "readCount"]
+                : ["id", "name", "type", "entityType", "labelsOrTypes", "properties", "ownedIndex", "propertyType"];
+            string[] all = indexes
+                ? [.. defaults, "trackedSince", "options", "failureMessage", "createStatement"]
+                : [.. defaults, "options", "createStatement"];
+            var cols = yield is null ? defaults : Columns(yield, all);
+            return new Result(cols, rows.Select(r => cols.Select(c => r.GetValueOrDefault(c)).ToArray()).ToList());
+        }
         return null;
     }
+
+    [GeneratedRegex(@"^show\s+(?:(?<type>all|range|text|point|fulltext|vector|lookup|unique|node\s+unique|uniqueness|node\s+uniqueness|existence|node\s+key|key)\s+)?(?<what>indexes|index|constraints|constraint)\b(?:.*?\byield\s+(?<yield>.+?))?(?:\s+where\s+.*)?\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex ShowSchema();
+
+    /// <summary>Columns of a YIELD list (<c>*</c> = all), with the canonical casing.</summary>
+    private static string[] Columns(string yield, string[] all) =>
+        yield.Trim() == "*"
+            ? all
+            : yield.Split(',')
+                .Select(c => c.Trim())
+                .Where(c => c.Length > 0)
+                .Select(c => all.FirstOrDefault(a => a.Equals(c, StringComparison.OrdinalIgnoreCase)) ?? c)
+                .ToArray();
 
     private static Result Rows(string[] columns, params Value[][] rows) => new(columns, rows.ToList());
     private static Value S(string s) => Value.FromString(s);

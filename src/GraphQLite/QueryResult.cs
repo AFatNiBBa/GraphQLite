@@ -191,10 +191,11 @@ public sealed class QueryResult : IReadOnlyList<Record>
         {
             switch (v.Kind)
             {
+                // already materialized: virtual entities (db.schema.visualization) do not exist in the store
                 case ValueKind.Node:
-                    return Value.FromNode(GetNode(v.EntityId));
+                    return v.Obj is Node ? v : Value.FromNode(GetNode(v.EntityId));
                 case ValueKind.Relationship:
-                    return Value.FromRel(GetRel(v.EntityId));
+                    return v.Obj is Relationship ? v : Value.FromRel(GetRel(v.EntityId));
                 case ValueKind.Path:
                     {
                         var p = (GraphPath)v.Obj!;

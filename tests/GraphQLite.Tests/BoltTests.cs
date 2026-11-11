@@ -394,6 +394,46 @@ public sealed class BoltTests : IAsyncLifetime
         Assert.Equal(2L, expand[0]["allNeighboursCount"].As<long>());
     }
 
+    /// <summary>Queries of the newer Neo4j Query app (browser.neo4j.io, 2025+), captured from its WebSocket traffic.</summary>
+    [Fact]
+    public async Task Neo4j_Query_App_Queries()
+    {
+        await Run("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE");
+        await Run("CREATE INDEX FOR (c:City) ON (c.name)");
+        await Run("CREATE (:Person:Dev {email: 'a'})-[:LIVES_IN]->(:City {name: 'Roma'})");
+        async Task<List<N.IRecord>> Read(string q, string db = "neo4j")
+        {
+            await using var session = _driver.AsyncSession(o => o.WithDatabase(db).WithDefaultAccessMode(N.AccessMode.Read));
+            return await session.ExecuteReadAsync(async tx => await (await tx.RunAsync(q)).ToListAsync());
+        }
+        Assert.Equal("neo4j", (await Read("CALL dbms.info();", "system")).Single()["name"].As<string>());
+        Assert.Single(await Read("SHOW CURRENT USER", "system"));
+        Assert.Equal(2, (await Read("SHOW DATABASES YIELD *;", "system")).Count);
+
+        var indexes = await Read("SHOW INDEXES");
+        Assert.Equal(2, indexes.Count);
+        Assert.Contains(indexes, r => r["type"].As<string>() == "RANGE" && r["labelsOrTypes"].As<List<string>>()[0] == "City");
+        Assert.Contains(indexes, r => r["owningConstraint"].As<string?>() is { Length: > 0 });
+        var vector = await Read(
+            "SHOW VECTOR INDEXES YIELD id, name, state, populationPercent, type, entityType, labelsOrTypes, properties, indexProvider, owningConstraint, lastRead, readCount, options");
+        Assert.Empty(vector);
+        Assert.Single(await Read("SHOW CONSTRAINTS"));
+
+        var schema = (await Read("CALL db.schema.visualization() YIELD nodes, relationships")).Single();
+        var nodes = schema["nodes"].As<List<N.INode>>();
+        Assert.Equal(["City", "Dev", "Person"], nodes.Select(n => n.Labels[0]).Order());
+        var rel = schema["relationships"].As<List<N.IRelationship>>();
+        Assert.Equal(2, rel.Count);
+        Assert.All(rel, r => Assert.Equal("LIVES_IN", r.Type));
+
+        var meta = await Read("""
+            CALL db.labels() YIELD label RETURN COLLECT(label)[..$itemLimit] AS result
+            UNION ALL CALL db.relationshipTypes() YIELD relationshipType RETURN COLLECT(relationshipType)[..$itemLimit] AS result
+            UNION ALL CALL db.propertyKeys() YIELD propertyKey RETURN COLLECT(propertyKey)[..$itemLimit] AS result
+            """.Replace("$itemLimit", "1000"));
+        Assert.Equal(3, meta.Count);
+    }
+
     [Fact]
     public async Task Http_Request_Gets_The_Discovery_Document()
     {

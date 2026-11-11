@@ -50,8 +50,46 @@ internal static class Procedures
             return [[Value.FromInt(s.NodeCount), Value.FromInt(s.RelCount), Value.FromInt(s.Labels.Count), Value.FromInt(s.RelTypes.Count),
                 Value.FromInt(s.PropKeys.Count), Value.FromInt(s.DataPages)]];
         });
+        Add("db.schema.visualization", ["nodes", "relationships"], (ctx, _) => [SchemaVisualization(ctx)]);
         Add("dbms.components", ["name", "versions", "edition"], (ctx, _) =>
             [[Value.FromString("GraphQLite"), Value.FromList([Value.FromString(typeof(Procedures).Assembly.GetName().Version?.ToString() ?? "0")]), Value.FromString("embedded")]]);
+    }
+
+    /// <summary>
+    /// The schema as a graph, like Neo4j: one virtual node per label (negative ids, properties <c>name</c>,
+    /// <c>indexes</c>, <c>constraints</c>) and one virtual relationship per (start label, type, end label).
+    /// </summary>
+    private static Value[] SchemaVisualization(ExecContext ctx)
+    {
+        var s = ctx.Store;
+        var catalog = s.Catalog;
+        var nodes = new Dictionary<int, Node>();
+        Node LabelNode(int label)
+        {
+            if (nodes.TryGetValue(label, out var n)) return n;
+            var ixs = catalog.ForLabel(label);
+            string name = s.Labels.Name(label);
+            var props = new Dictionary<string, Value>
+            {
+                ["name"] = Value.FromString(name),
+                ["indexes"] = Value.FromList(ixs.Where(i => !i.Unique).Select(i => Value.FromString(s.PropKeys.Name(i.Key))).ToArray()),
+                ["constraints"] = Value.FromList(ixs.Where(i => i.Unique)
+                    .Select(i => Value.FromString($"Constraint( name='{i.Name}', type='UNIQUENESS', schema=(:{name} {{{s.PropKeys.Name(i.Key)}}}) )"))
+                    .ToArray()),
+            };
+            return nodes[label] = new Node(-1L - label, [name], props);
+        }
+        for (int l = 0; l < s.Labels.Count; l++)
+            if (s.LabelCount(l) > 0) LabelNode(l);
+        var rels = new List<Value>();
+        foreach (var (from, type, to) in s.SchemaTriples(ctx.Cancellation).OrderBy(t => t))
+        {
+            string typeName = s.RelTypes.Name(type);
+            var r = new Relationship(-1L - rels.Count, typeName, LabelNode(from).Id, LabelNode(to).Id,
+                new Dictionary<string, Value> { ["name"] = Value.FromString(typeName) });
+            rels.Add(Value.FromRel(r));
+        }
+        return [Value.FromList(nodes.Values.OrderBy(n => n.Id).Select(Value.FromNode).Reverse().ToArray()), Value.FromList(rels.ToArray())];
     }
 
     private static void Add(string name, string[] outputs, Func<ExecContext, Value[], IEnumerable<Value[]>> body) =>

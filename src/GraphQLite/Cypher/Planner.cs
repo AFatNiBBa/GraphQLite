@@ -122,6 +122,13 @@ internal sealed partial class Planner
                         op = new ProcedureCallOp(op, proc, args, outSlots);
                         return (op, proc.Outputs, outSlots);
                     }
+                case CallClause cc when last && i == 0 && unionSlots is null:
+                    {
+                        // standalone call with YIELD (and optionally WHERE): returns the yielded columns
+                        op = PlanClause(op, scope, cc);
+                        var cols = cc.Yields!.Select(y => y.Alias).ToArray();
+                        return (op, cols, cols.Select(c => scope[c]).ToArray());
+                    }
                 default:
                     op = PlanClause(op, scope, clause);
                     if (last)

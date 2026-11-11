@@ -158,7 +158,8 @@ Cosa supporta:
   quindi la logica di retry dei driver funziona come con Neo4j;
 - le query di amministrazione che gli strumenti inviano al database `system`: `CALL dbms.components()`,
   `SHOW DATABASES`, `CALL dbms.showCurrentUser()` / `SHOW CURRENT USER`, `CALL dbms.clientConfig()`,
-  `SHOW PROCEDURES` / `SHOW FUNCTIONS`. Il server si presenta come Neo4j 5.26 community.
+  `SHOW PROCEDURES` / `SHOW FUNCTIONS`, `CALL dbms.info()`, `SHOW [tipo] INDEXES` / `SHOW CONSTRAINTS` (con `YIELD`).
+  Il server si presenta come Neo4j 5.26 community.
 
 ### Neo4j Browser
 
@@ -171,6 +172,8 @@ solo connessioni cifrate con un certificato di cui il browser si fida:
 3. in Neo4j Browser collegarsi a `neo4j+s://localhost:7687` (il server stampa il link già pronto).
 
 Una copia di Neo4j Browser servita in http (per esempio da Neo4j Desktop) può usare anche `neo4j://` senza TLS.
+Provato con l'app Query/Browser di <https://browser.neo4j.io> (2025): connessione, query, grafo, pannello dello schema e
+ordinamento delle label (*Update styling priority*).
 
 Limiti del server:
 - un solo database per processo (più il database `system`, virtuale): Neo4j Enterprise ne gestisce più di uno nello
@@ -275,7 +278,9 @@ Gli indici **unique** (i constraint) hanno in più un **indice hash** (linear ha
 uguaglianza e `IN` e per verificare il vincolo: un lookup costa circa un terzo della discesa nel B+tree.
 
 **Procedure**: `db.labels`, `db.relationshipTypes`, `db.propertyKeys`, `db.indexes`, `db.constraints`, `db.stats`,
-`dbms.components`.
+`db.schema.visualization` (lo schema come grafo: un nodo virtuale per label e una relazione per ogni combinazione
+label–tipo–label; legge tutte le relazioni), `dbms.components`. Una `CALL` può anche chiudere la query da sola, con o
+senza `YIELD` (`CALL db.labels() YIELD label`).
 
 **Parametri .NET**: primitivi, `string`, `DateOnly`, `TimeOnly`, `DateTime`, `DateTimeOffset`, `TimeSpan`,
 dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.

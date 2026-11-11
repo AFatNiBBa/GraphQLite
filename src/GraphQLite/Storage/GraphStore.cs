@@ -1249,6 +1249,43 @@ internal sealed unsafe class StoreTx
         VecSet(rt, type, VecGet(rt, type) - 1);
     }
 
+    /// <summary>
+    /// Distinct (start label, type, end label) combinations of the relationships: the graph schema. Reads every
+    /// node and its outgoing adjacency, so it costs a scan of the relationships.
+    /// </summary>
+    public HashSet<(int From, int Type, int To)> SchemaTriples(CancellationToken ct)
+    {
+        var set = new HashSet<(int, int, int)>();
+        var labelCache = new Dictionary<long, int[]>();
+        int[] LabelsOf(long id)
+        {
+            if (labelCache.TryGetValue(id, out var l)) return l;
+            if (labelCache.Count > 1 << 16) labelCache.Clear();
+            return labelCache[id] = NodeLabels(id);
+        }
+        long high = NodeHigh;
+        for (long n = 0; n < high; n++)
+        {
+            if ((n & 0xFFFF) == 0) ct.ThrowIfCancellationRequested();
+            if (!NodeAlive(n) || NR(n)->OutDegree == 0) continue;
+            var from = LabelsOf(n);
+            if (from.Length == 0) continue;
+            for (long a = AdjHead(n, true); a != 0;)
+            {
+                var b = (AdjBlock*)R(a);
+                var es = Entries((byte*)b);
+                for (int i = 0; i < b->Count; i++)
+                {
+                    var e = es[i];
+                    foreach (int to in LabelsOf(e.Other))
+                        foreach (int f in from) set.Add((f, e.Type, to));
+                }
+                a = b->Next;
+            }
+        }
+        return set;
+    }
+
     /// <summary>Relationship ids attached to a node (both directions, self loops once).</summary>
     public List<long> NodeRels(long node)
     {

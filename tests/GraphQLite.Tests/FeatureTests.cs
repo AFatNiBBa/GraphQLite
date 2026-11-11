@@ -352,4 +352,37 @@ public class FeatureTests : IDisposable
         Assert.Equal(5000, s.NodesCreated);
         Assert.Equal(12497500L, Q("MATCH (r:Row) RETURN sum(r.n)").Scalar<long>());
     }
+
+    // ------------------------------------------------------------------ procedures
+
+    [Fact]
+    public void Standalone_Call_With_Yield()
+    {
+        Q("CREATE (:A), (:B)");
+        var r = Q("CALL db.labels() YIELD label");
+        Assert.Equal(["label"], r.Columns);
+        Assert.Equal(["A", "B"], r.Select(x => x.Get<string>(0)).Order());
+        var renamed = Q("CALL db.labels() YIELD label AS l WHERE l = 'B'");
+        Assert.Equal(["l"], renamed.Columns);
+        Assert.Equal("B", renamed.Single().Get<string>("l"));
+    }
+
+    [Fact]
+    public void Schema_Visualization()
+    {
+        Q("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE");
+        Q("CREATE INDEX FOR (c:City) ON (c.name)");
+        Q("CREATE (:Person:Dev {email: 'a'})-[:LIVES_IN]->(:City {name: 'Roma'}), (:Person {email: 'b'})-[:KNOWS]->(:Person {email: 'c'})");
+        var row = Q("CALL db.schema.visualization() YIELD nodes, relationships").Single();
+        var nodes = row["nodes"].AsList().Select(v => v.AsNode()).ToDictionary(n => n.Labels[0]);
+        Assert.Equal(["City", "Dev", "Person"], nodes.Keys.Order());
+        Assert.All(nodes.Values, n => Assert.True(n.Id < 0));
+        Assert.Equal("name", nodes["City"]["indexes"].AsList()[0].AsString());
+        Assert.Single(nodes["Person"]["constraints"].AsList());
+        var rels = row["relationships"].AsList().Select(v => v.AsRelationship())
+            .Select(r => (nodes.Values.Single(n => n.Id == r.StartNodeId).Labels[0], r.Type, nodes.Values.Single(n => n.Id == r.EndNodeId).Labels[0]))
+            .Order()
+            .ToList();
+        Assert.Equal([("Dev", "LIVES_IN", "City"), ("Person", "KNOWS", "Person"), ("Person", "LIVES_IN", "City")], rels);
+    }
 }
