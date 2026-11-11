@@ -193,9 +193,12 @@ Le tecniche principali:
 - operatori pull che scrivono in-place su un'unica riga;
 - planner cost-based (index seek per uguaglianza/IN/range/prefisso, seek per `id()`, scan della label più piccola,
   `ExpandInto` sui cicli, Top-N con heap, `shortestPath` con BFS bidirezionale);
-- **aggregazioni parallele**: un'aggregazione sopra una scansione di nodi grande (≥ 16k righe per thread) divide lo
-  spazio degli id in intervalli, li aggrega su più thread e unisce i risultati nell'ordine degli intervalli, quindi il
-  risultato è identico a quello sequenziale (a parte l'arrotondamento delle somme di float). Vale per le transazioni di
+- **query parallele**: sopra una scansione di nodi grande (≥ 16k righe per thread) lo spazio degli id viene diviso in
+  intervalli elaborati su più thread, e i risultati si uniscono nell'ordine degli intervalli, quindi righe e ordine
+  sono identici all'esecuzione sequenziale (a parte l'arrotondamento delle somme di float). Vale per le aggregazioni,
+  per `ORDER BY` (ordinamento o top-N per intervallo, poi fusione) e per le query che restituiscono righe (filtri,
+  espansioni, proiezioni, `DISTINCT`, `SKIP`, `UNION`): lì i worker restano pochi intervalli avanti rispetto a chi legge
+  il risultato, che arriva in streaming, e materializzano già nodi e relazioni restituiti. Vale per le transazioni di
   sola lettura; `DatabaseOptions.MaxDegreeOfParallelism` (default: numero di core, `1` la disattiva);
 - cache dei piani lock-free;
 - lookup delle pagine con tabelle sparse lock-free (due accessi ad array);
@@ -333,8 +336,12 @@ dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
 - Le transazioni concorrenti rieseguono le query al commit se nel frattempo altri hanno committato: con molti
   scrittori che toccano gli stessi dati costano più delle esclusive e possono andare in conflitto ripetutamente.
   Gli id dei nodi e delle relazioni delle transazioni annullate o in conflitto non vengono riutilizzati.
-- Le query parallele riguardano solo le aggregazioni sopra una scansione di nodi: le query che restituiscono molte righe
-  senza aggregare, e le transazioni di scrittura, restano su un solo thread.
+- Le query parallele partono solo da una scansione di nodi (per label o di tutti i nodi), non da un index seek, e solo
+  nel piano principale (non dentro `CALL { }` od `OPTIONAL MATCH`). Sotto un `LIMIT` senza `ORDER BY` la scansione resta
+  sequenziale, perché si ferma dopo poche righe. Le transazioni di scrittura restano su un solo thread: ogni riga deve
+  vedere le modifiche delle precedenti, e lo scrittore è uno solo.
+- Restituire molti nodi interi (`RETURN n`) costa soprattutto allocazioni: ogni nodo materializzato ha il suo
+  dizionario delle proprietà.
 - Le date sono limitate agli anni 1–9999 e la precisione temporale è di 100 ns (tick .NET).
 - Gli indici coprono una sola proprietà (niente indici compositi o full-text).
 - Una transazione di scrittura tiene in memoria le pagine che modifica: per import molto grandi usare

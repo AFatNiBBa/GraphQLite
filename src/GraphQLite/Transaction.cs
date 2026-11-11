@@ -311,6 +311,7 @@ public sealed class Transaction : IDisposable
     {
         if (_finished) return;
         _finished = true;
+        _open?.StopBackground();
         _open = null;
         if (IsReadOnly)
         {

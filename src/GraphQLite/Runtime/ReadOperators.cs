@@ -1049,6 +1049,7 @@ internal sealed class FilterOp(Operator input, Eval predicate, string text) : Un
     public override string Name => "Filter";
     public override bool RowLocal => true;
     public override string Details => text;
+    public override UnaryOperator WithInput(Operator input) => new FilterOp(input, predicate, text);
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, predicate);
 
     private sealed class C(Cursor input, ExecContext ctx, Eval predicate) : Cursor
@@ -1070,6 +1071,7 @@ internal sealed class ProjectionOp(Operator input, int[] slots, Eval[] evals, st
     public override string Name => "Projection";
     public override bool RowLocal => true;
     public override string Details => desc;
+    public override UnaryOperator WithInput(Operator input) => new ProjectionOp(input, slots, evals, desc);
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slots, evals);
 
     private sealed class C(Cursor input, ExecContext ctx, int[] slots, Eval[] evals) : Cursor
@@ -1220,6 +1222,7 @@ internal sealed class ApplyOp(Operator input, Operator inner, bool unit, Eval? b
 internal sealed class SkipOp(Operator input, Eval count) : UnaryOperator(input)
 {
     public override string Name => "Skip";
+    public override UnaryOperator WithInput(Operator input) => new SkipOp(input, count);
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, count);
 
     private sealed class C(Cursor input, ExecContext ctx, Eval count) : Cursor
@@ -1271,6 +1274,7 @@ internal sealed class LimitOp(Operator input, Eval count) : UnaryOperator(input)
 internal sealed class DistinctOp(Operator input, int[] slots) : UnaryOperator(input)
 {
     public override string Name => "Distinct";
+    public override UnaryOperator WithInput(Operator input) => new DistinctOp(input, slots);
     public override Cursor Open(ExecContext ctx) => new C(Input.Open(ctx), ctx, slots);
 
     private sealed class C(Cursor input, ExecContext ctx, int[] slots) : Cursor
@@ -1318,76 +1322,127 @@ internal sealed class EagerOp(Operator input) : UnaryOperator(input)
 
 internal readonly record struct SortKey(Eval Eval, bool Descending);
 
+
 internal sealed class SortComparer(SortKey[] keys) : IComparer<(Value[] Keys, Value[] Row, int Seq)>
 {
     public int Compare((Value[] Keys, Value[] Row, int Seq) a, (Value[] Keys, Value[] Row, int Seq) b)
     {
+        int c = CompareKeys(a.Keys, b.Keys);
+        return c != 0 ? c : a.Seq.CompareTo(b.Seq);
+    }
+
+    public int CompareKeys(Value[] a, Value[] b)
+    {
         for (int i = 0; i < keys.Length; i++)
         {
-            int c = ValueOps.OrderCompare(a.Keys[i], b.Keys[i]);
+            int c = ValueOps.OrderCompare(a[i], b[i]);
             if (c != 0) return keys[i].Descending ? -c : c;
         }
-        return a.Seq.CompareTo(b.Seq);
+        return 0;
     }
 }
 
-/// <summary>Full sort, or top-N (heap based) when a limit is known.</summary>
+/// <summary>
+/// Full sort, or top-N (heap based) when a limit is known. Over a partitioned scan (read-only transactions), every
+/// node id range is sorted by a worker and the sorted ranges are merged; ties keep the order of a sequential run.
+/// </summary>
 internal sealed class SortOp(Operator input, SortKey[] keys, Eval? limit) : UnaryOperator(input)
 {
     private readonly SortKey[] keys = keys;
     private readonly Eval? limit = limit;
+    private readonly Operator? _leaf = Partitioning.FindLeaf(input);
 
     public override string Name => limit is null ? "Sort" : "Top";
-    public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
+    public override Cursor Open(ExecContext ctx) => new C(this, ctx);
 
-    private sealed class C(SortOp op, Cursor input, ExecContext ctx) : Cursor
+    /// <summary>The rows of <paramref name="input"/> in order, the first <paramref name="n"/> only when n is not negative.</summary>
+    private (Value[] Keys, Value[] Row, int Seq)[] Collect(Cursor input, ExecContext ctx, long n, SortComparer cmp)
+    {
+        int seq = 0;
+        if (n < 0)
+        {
+            var list = new List<(Value[], Value[], int)>();
+            while (input.Next())
+            {
+                var k = new Value[keys.Length];
+                for (int i = 0; i < k.Length; i++) k[i] = keys[i].Eval(ctx);
+                list.Add((k, RowOps.Snapshot(ctx.Row), seq++));
+            }
+            var all = list.ToArray();
+            Array.Sort(all, cmp);
+            return all;
+        }
+        var heap = new PriorityQueue<(Value[] Keys, Value[] Row, int Seq), (Value[] Keys, Value[] Row, int Seq)>(
+            Comparer<(Value[], Value[], int)>.Create((a, b) => cmp.Compare(b, a)));
+        // the keys of a row go into a reused array, copied only when the row enters the heap
+        var probe = new Value[keys.Length];
+        while (input.Next())
+        {
+            if (n == 0) continue;
+            for (int i = 0; i < probe.Length; i++) probe[i] = keys[i].Eval(ctx);
+            var cand = (probe, (Value[])null!, seq++);
+            if (heap.Count < n || cmp.Compare(cand, heap.Peek()) < 0)
+            {
+                cand.Item1 = (Value[])probe.Clone();
+                cand.Item2 = RowOps.Snapshot(ctx.Row);
+                if (heap.Count < n) heap.Enqueue(cand, cand);
+                else heap.EnqueueDequeue(cand, cand);
+            }
+        }
+        var top = new (Value[], Value[], int)[heap.Count];
+        for (int i = top.Length - 1; i >= 0; i--) top[i] = heap.Dequeue();
+        return top;
+    }
+
+    /// <summary>Sorts every range in parallel, then merges the sorted ranges (equal keys: the earlier range first).</summary>
+    private (Value[] Keys, Value[] Row, int Seq)[] CollectParallel(ExecContext ctx, int workers, long n, SortComparer cmp)
+    {
+        var (size, count) = Partitioning.Ranges(ctx, workers);
+        var parts = new (Value[] Keys, Value[] Row, int Seq)[count][];
+        _ = ctx.Now; // read lazily: fixed before the workers copy them
+        _ = ctx.Seed;
+        Partitioning.For(count, workers, i =>
+        {
+            var w = ctx.ForPartition(_leaf!, i * size, (i + 1) * size);
+            parts[i] = Collect(Input.Open(w), w, n, cmp);
+        });
+        long total = 0;
+        foreach (var p in parts) total += p.Length;
+        var result = new (Value[], Value[], int)[n < 0 ? total : Math.Min(n, total)];
+        var pos = new int[count];
+        // the priority of a range is its current row: it changes only while the range is out of the queue
+        var queue = new PriorityQueue<int, int>(count, Comparer<int>.Create((a, b) =>
+        {
+            int c = cmp.CompareKeys(parts[a][pos[a]].Keys, parts[b][pos[b]].Keys);
+            return c != 0 ? c : a.CompareTo(b);
+        }));
+        for (int i = 0; i < count; i++)
+        {
+            if (parts[i].Length > 0) queue.Enqueue(i, i);
+        }
+        for (int r = 0; r < result.Length; r++)
+        {
+            int i = queue.Dequeue();
+            result[r] = parts[i][pos[i]];
+            parts[i][pos[i]] = default;
+            if (++pos[i] < parts[i].Length) queue.Enqueue(i, i);
+        }
+        return result;
+    }
+
+    private sealed class C(SortOp op, ExecContext ctx) : Cursor
     {
         private (Value[] Keys, Value[] Row, int Seq)[]? _rows;
         private int _pos;
-
-        private Value[] Keys()
-        {
-            var k = new Value[op.keys.Length];
-            for (int i = 0; i < k.Length; i++) k[i] = op.keys[i].Eval(ctx);
-            return k;
-        }
 
         public override bool Next()
         {
             if (_rows is null)
             {
                 var cmp = new SortComparer(op.keys);
-                int seq = 0;
-                if (op.limit is null)
-                {
-                    var list = new List<(Value[], Value[], int)>();
-                    while (input.Next()) list.Add((Keys(), RowOps.Snapshot(ctx.Row), seq++));
-                    _rows = list.ToArray();
-                    Array.Sort(_rows, cmp);
-                }
-                else
-                {
-                    long n = LimitOp.EvalCount(ctx, op.limit, "LIMIT");
-                    var heap = new PriorityQueue<(Value[] Keys, Value[] Row, int Seq), (Value[] Keys, Value[] Row, int Seq)>(
-                        Comparer<(Value[], Value[], int)>.Create((a, b) => cmp.Compare(b, a)));
-                    // the keys of a row go into a reused array, copied only when the row enters the heap
-                    var probe = new Value[op.keys.Length];
-                    while (input.Next())
-                    {
-                        if (n == 0) continue;
-                        for (int i = 0; i < probe.Length; i++) probe[i] = op.keys[i].Eval(ctx);
-                        var cand = (probe, (Value[])null!, seq++);
-                        if (heap.Count < n || cmp.Compare(cand, heap.Peek()) < 0)
-                        {
-                            cand.Item1 = (Value[])probe.Clone();
-                            cand.Item2 = RowOps.Snapshot(ctx.Row);
-                            if (heap.Count < n) heap.Enqueue(cand, cand);
-                            else heap.EnqueueDequeue(cand, cand);
-                        }
-                    }
-                    _rows = new (Value[], Value[], int)[heap.Count];
-                    for (int i = _rows.Length - 1; i >= 0; i--) _rows[i] = heap.Dequeue();
-                }
+                long n = op.limit is null ? -1 : LimitOp.EvalCount(ctx, op.limit, "LIMIT");
+                int workers = Partitioning.Workers(ctx, op._leaf);
+                _rows = workers > 1 ? op.CollectParallel(ctx, workers, n, cmp) : op.Collect(op.Input.Open(ctx), ctx, n, cmp);
             }
             if (_pos >= _rows.Length) return false;
             RowOps.Restore(_rows[_pos].Row, ctx.Row);
@@ -1404,6 +1459,7 @@ internal sealed class UnionOp(Operator[] branches, int[] columnSlots, bool disti
     private readonly bool distinct = distinct;
 
     public override string Name => distinct ? "Union" : "UnionAll";
+    public UnionOp WithBranches(Operator[] newBranches) => new(newBranches, columnSlots, distinct);
     public override IEnumerable<Operator> Children => branches;
     public override Cursor Open(ExecContext ctx) => new C(this, ctx);
 

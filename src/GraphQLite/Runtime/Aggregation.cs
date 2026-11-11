@@ -311,20 +311,7 @@ internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEval
     /// Scan at the bottom of the input when the input is a chain of row-local operators: its id space can then
     /// be split into ranges aggregated in parallel and merged.
     /// </summary>
-    private readonly Operator? _parallelLeaf = FindParallelLeaf(input);
-
-    /// <summary>Minimum estimated input rows per worker for a parallel aggregation.</summary>
-    internal const long ParallelRowsPerWorker = 16_384;
-
-    private static Operator? FindParallelLeaf(Operator op)
-    {
-        while (op.RowLocal && op is UnaryOperator u)
-        {
-            if (op is IPartitionedScan && u.Input is StartOp) return op;
-            op = u.Input;
-        }
-        return null;
-    }
+    private readonly Operator? _parallelLeaf = Partitioning.FindLeaf(input);
 
     /// <summary>
     /// Slots read by the grouping keys, when the keys are deterministic functions of them and the input performs no
@@ -450,41 +437,22 @@ internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEval
         return true;
     }
 
-    /// <summary>Number of workers worth using for this execution (1 = sequential).</summary>
-    private int Workers(ExecContext ctx)
-    {
-        if (_parallelLeaf is null || ctx.Store.IsWriter) return 1;
-        int max = ctx.Options.MaxDegreeOfParallelism;
-        if (max <= 1) return 1;
-        long rows = ((IPartitionedScan)_parallelLeaf).EstimateRows(ctx.Store);
-        return (int)Math.Min(max, rows / ParallelRowsPerWorker);
-    }
-
     /// <summary>
     /// Aggregates contiguous node id ranges in parallel and merges them in range order, so groups, first-row
     /// snapshots and collect() order are the same as in a sequential run.
     /// </summary>
     private Partial AggregateParallel(ExecContext ctx, int workers)
     {
-        long high = ctx.Store.NodeHigh;
-        long size = Math.Max(4096, ((high + workers * 8 - 1) / (workers * 8) + 63) & ~63L);
-        int chunks = (int)((high + size - 1) / size);
+        var (size, chunks) = Partitioning.Ranges(ctx, workers);
         var parts = new Partial[chunks];
         var leaf = _parallelLeaf!;
         int hint = 0; // groups of the last chunk aggregated: ranges of the same size tend to have as many
-        try
+        Partitioning.For(chunks, workers, i =>
         {
-            Parallel.For(0, chunks, new ParallelOptions { MaxDegreeOfParallelism = workers }, i =>
-            {
-                var w = ctx.ForPartition(leaf, i * size, (i + 1) * size);
-                var p = parts[i] = Aggregate(Input.Open(w), w, Volatile.Read(ref hint));
-                if (p.Groups != null) Volatile.Write(ref hint, p.Groups.Count);
-            });
-        }
-        catch (AggregateException ae)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
-        }
+            var w = ctx.ForPartition(leaf, i * size, (i + 1) * size);
+            var p = parts[i] = Aggregate(Input.Open(w), w, Volatile.Read(ref hint));
+            if (p.Groups != null) Volatile.Write(ref hint, p.Groups.Count);
+        });
         var result = new Partial();
         if (keyEvals.Length == 0)
         {
@@ -516,7 +484,7 @@ internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEval
 
         private void Run()
         {
-            int workers = op.Workers(ctx);
+            int workers = Partitioning.Workers(ctx, op._parallelLeaf);
             var part = workers > 1 ? op.AggregateParallel(ctx, workers) : op.Aggregate(input, ctx);
             _out = op.keyEvals.Length == 0
                 ? Enumerable.Repeat(part.Single ?? op.NewGroup(new Group(), ctx), 1).GetEnumerator()

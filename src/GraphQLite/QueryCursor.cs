@@ -155,8 +155,12 @@ public sealed class QueryCursor : IDisposable
         }
     }
 
+    /// <summary>Stops the parallel workers of the statement (they read its snapshot): before the transaction ends.</summary>
+    internal void StopBackground() => _ctx?.StopBackground();
+
     private void Release()
     {
+        _ctx?.StopBackground();
         _cursor = null;
         _mat = null;
         _tx.CursorClosed(this);
