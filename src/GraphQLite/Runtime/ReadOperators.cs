@@ -1370,19 +1370,19 @@ internal sealed class SortOp(Operator input, SortKey[] keys, Eval? limit) : Unar
                     long n = LimitOp.EvalCount(ctx, op.limit, "LIMIT");
                     var heap = new PriorityQueue<(Value[] Keys, Value[] Row, int Seq), (Value[] Keys, Value[] Row, int Seq)>(
                         Comparer<(Value[], Value[], int)>.Create((a, b) => cmp.Compare(b, a)));
+                    // the keys of a row go into a reused array, copied only when the row enters the heap
+                    var probe = new Value[op.keys.Length];
                     while (input.Next())
                     {
                         if (n == 0) continue;
-                        var cand = (Keys(), (Value[])null!, seq++);
-                        if (heap.Count < n)
+                        for (int i = 0; i < probe.Length; i++) probe[i] = op.keys[i].Eval(ctx);
+                        var cand = (probe, (Value[])null!, seq++);
+                        if (heap.Count < n || cmp.Compare(cand, heap.Peek()) < 0)
                         {
+                            cand.Item1 = (Value[])probe.Clone();
                             cand.Item2 = RowOps.Snapshot(ctx.Row);
-                            heap.Enqueue(cand, cand);
-                        }
-                        else if (cmp.Compare(cand, heap.Peek()) < 0)
-                        {
-                            cand.Item2 = RowOps.Snapshot(ctx.Row);
-                            heap.EnqueueDequeue(cand, cand);
+                            if (heap.Count < n) heap.Enqueue(cand, cand);
+                            else heap.EnqueueDequeue(cand, cand);
                         }
                     }
                     _rows = new (Value[], Value[], int)[heap.Count];

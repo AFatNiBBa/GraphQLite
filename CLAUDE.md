@@ -51,6 +51,11 @@ Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'
 - Gli indici unique hanno anche un `HashIndex` (`IndexDef.HashSlot`, flag nel catalogo; i cataloghi senza flag restano validi e usano solo il B+tree). Salva solo (hash a 64 bit, id), non i valori: i risultati sono **candidati** da verificare (filtro del planner, `FindConflict`). `HashIndex.HashOf` è persistito su disco: non va mai cambiato. Usato per `Equal`/`In` nel seek e per i controlli di unicità; range, prefissi e backfill restano sul B+tree
 - Il blob del catalogo non viene mai liberato: il suo indirizzo è univoco e fa da chiave per la cache dei piani
 - Aggregazioni parallele (`AggregateOp`): se l'input è una catena di operatori con `RowLocal == true` che parte da uno scan `IPartitionedScan` sopra `StartOp`, nelle transazioni di sola lettura lo spazio degli id viene diviso in blocchi; ogni worker ha un proprio `ExecContext` (`ForPartition`) e lo scan legge l'intervallo con `ctx.PartitionOf(this)`. I parziali si uniscono in ordine di blocco con `Aggregator.Merge`, così gruppi, snapshot e ordine di `collect()` coincidono con l'esecuzione sequenziale
+- Gruppi di `AggregateOp` (possono essere milioni, ogni byte conta: il GC pesava metà del tempo con 200k gruppi):
+  - stanno in un `HashSet<Group>` (voci da 16 byte contro 24 del `Dictionary`: i set dei blocchi restano sotto gli 85 KB del Large Object Heap, che faceva scattare una gen2 a ogni query) e l'ordine di prima apparizione viene dall'enumerazione del set senza rimozioni;
+  - chiave singola inline, `count()` da solo senza aggregatore (`_countOnly`);
+  - snapshot della prima riga solo se un'espressione dopo l'aggregazione legge una variabile che non è chiave (`FreeVarsOutsideAggregates`);
+  - `_keyDeps`: se le chiavi sono deterministiche (`IsRandom`) e l'input non scrive, righe consecutive con gli stessi valori negli slot letti dalle chiavi riusano il gruppo precedente senza valutare né cercare la chiave
 - Le pagine private (copy-on-write, overlay, recovery) si allocano con `Pages.Alloc` / `Pages.Free`, che usano un pool: mai `NativeMemory` direttamente
 
 ## Trappole (invarianti da rispettare)

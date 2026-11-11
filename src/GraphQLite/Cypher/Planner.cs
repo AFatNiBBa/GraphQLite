@@ -412,7 +412,19 @@ internal sealed partial class Planner
             if (proj.OrderBy != null)
                 foreach (var s in proj.OrderBy) AddAggregates(s.Expr);
 
-            op = new AggregateOp(op, keySlots.ToArray(), keyEvals.ToArray(), aggs.ToArray());
+            // slots the grouping keys depend on, when the keys are deterministic (see AggregateOp._keyDeps)
+            int[]? keyDeps = null;
+            var keyExprs = items.Select(it => it.Expr).Where(e => !ContainsAggregate(e)).ToList();
+            if (!keyExprs.Any(IsRandom))
+                keyDeps = keyExprs.SelectMany(FreeVars)
+                    .Where(scope.ContainsKey)
+                    .Select(v => scope[v])
+                    .Distinct()
+                    .ToArray();
+            // the expressions computed after the aggregation can read the input variables that are not grouping keys
+            // (from the first row of the group): only then the groups keep a snapshot of that row
+            bool snapshot = postItems.Any(p => FreeVarsOutsideAggregates(p.Expr).Any(v => scope.ContainsKey(v) && !newScope.ContainsKey(v)));
+            op = new AggregateOp(op, keySlots.ToArray(), keyEvals.ToArray(), aggs.ToArray(), snapshot, keyDeps);
             _readsSinceBarrier = false;
             _varExpandSinceBarrier = false;
             _writesSinceBarrier = false;

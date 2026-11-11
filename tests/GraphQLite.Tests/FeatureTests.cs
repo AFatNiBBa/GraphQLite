@@ -48,6 +48,11 @@ public class FeatureTests : IDisposable
             "MATCH (n:N) WHERE n.i < 10 RETURN count(*)",
             "MATCH (n:Missing) RETURN count(*), collect(n)",
             "MATCH (n:N) WITH n.g AS g, count(*) AS c RETURN sum(c), count(g)",
+            // many groups, spanning several ranges and in order of first appearance
+            "MATCH (n:N) RETURN n.i % 5003 AS k, count(*) AS c, collect(n.i)[0..3] AS l",
+            "MATCH (n:N) RETURN n.s AS s, n.g AS g, count(n.f) AS c, max(n.i) AS m",
+            "MATCH (b:N)<-[:R]-(a) RETURN b.i AS i, count(a) AS c ORDER BY c DESC, i LIMIT 5",
+            "MATCH (a:M)-[:R]->(b) WITH a, count(b) AS c RETURN a.i, c ORDER BY a.i DESC LIMIT 3",
         ];
         foreach (var q in queries)
         {
@@ -56,6 +61,23 @@ public class FeatureTests : IDisposable
         }
         // errors raised by a worker surface as the original exception
         Assert.Throws<CypherRuntimeException>(() => par.Execute("MATCH (n:N) RETURN sum(n.s)"));
+    }
+
+    [Fact]
+    public void Grouping_Reuses_The_Group_Of_Consecutive_Rows_Only_When_Safe()
+    {
+        Q("CREATE (n:N {x: 0}) WITH n UNWIND range(1, 3) AS i CREATE (n)-[:R]->(:M {i: i})");
+        // consecutive rows of the same node, same group
+        Assert.Equal("1:3", string.Join(",", Q("MATCH (n:N)-[:R]->(m) RETURN n.x + 1 AS k, count(m) AS c").Select(r => $"{r["k"]}:{r["c"]}")));
+        // keys read through a write: every row sees a different value
+        var written = Q("MATCH (n:N)-[:R]->(m) SET n.x = n.x + 1 WITH n.x AS k, count(*) AS c RETURN k, c ORDER BY k");
+        Assert.Equal("1:1,2:1,3:1", string.Join(",", written.Select(r => $"{r["k"]}:{r["c"]}")));
+        // random keys are not reused either
+        Assert.Equal(3L, Q("MATCH (n:N)-[:R]->(m) WITH n, rand() AS k, count(*) AS c RETURN count(*)").Scalar<long>());
+        // groups in order of first appearance, also when the same key comes back later
+        Assert.Equal("1:3,2:1", string.Join(",", Q("UNWIND [1, 1, 2, 1] AS x RETURN x, count(*) AS c").Select(r => $"{r["x"]}:{r["c"]}")));
+        // after the aggregation, variables that are not keys come from the first row of the group
+        Assert.Equal([12L, 31L], Col<long>("UNWIND [{g: 1, v: 10}, {g: 1, v: 20}, {g: 2, v: 30}] AS r RETURN count(*) + r.v AS x, r.g AS g"));
     }
 
     // ------------------------------------------------------------------ JSON / nested properties

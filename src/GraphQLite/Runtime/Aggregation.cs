@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace GraphQLite.Runtime;
 
 internal abstract class Aggregator
@@ -256,22 +258,54 @@ internal sealed class AggSpec(AggKind kind, Eval? arg, Eval? param, bool distinc
     }
 }
 
-/// <summary>Hash aggregation. Each group keeps a snapshot of its first row so that grouping
-/// variables remain accessible to later expressions.</summary>
-internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEvals, AggSpec[] aggs) : UnaryOperator(input)
+/// <summary>
+/// Hash aggregation. When later expressions can read the variables of the input rows, each group keeps a snapshot
+/// of its first row.
+/// </summary>
+internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEvals, AggSpec[] aggs, bool snapshot, int[]? keyDeps)
+    : UnaryOperator(input)
 {
     private readonly int[] keySlots = keySlots;
     private readonly Eval[] keyEvals = keyEvals;
     private readonly AggSpec[] aggs = aggs;
+    private readonly bool snapshot = snapshot;
     public override string Name => keySlots.Length == 0 ? "Aggregation" : "EagerAggregation";
     public override string Details => string.Join(", ", aggs.Select(a => a.Text));
     public override Cursor Open(ExecContext ctx) => new C(this, Input.Open(ctx), ctx);
 
-    private sealed class Group(Value[] snapshot, Aggregator[] aggs)
+    /// <summary>
+    /// A group, kept small because there can be millions: one grouping key is stored inline, a single count() needs
+    /// no aggregator and a single aggregate no array.
+    /// </summary>
+    private sealed class Group
     {
-        public readonly Value[] Snapshot = snapshot;
-        public readonly Aggregator[] Aggs = aggs;
+        /// <summary>The grouping key, when there is only one.</summary>
+        public Value Key;
+        /// <summary>The grouping keys, when there are several.</summary>
+        public Value[]? Keys;
+        public Value[]? Snapshot;
+        /// <summary>Result of the only aggregate when it is a plain count() (<see cref="_countOnly"/>).</summary>
+        public long Count;
+        /// <summary>The aggregate, when there is only one.</summary>
+        public Aggregator? Agg;
+        /// <summary>The aggregates, when there are several.</summary>
+        public Aggregator[]? Aggs;
     }
+
+    /// <summary>Groups compare by their keys. Hash sets hold 16 bytes per group (a dictionary 24): smaller arrays stay off the large object heap.</summary>
+    private sealed class KeyComparer : IEqualityComparer<Group>
+    {
+        public static readonly KeyComparer Instance = new();
+
+        public bool Equals(Group? x, Group? y) => x!.Keys is null
+            ? ValueOps.Equivalent(x.Key, y!.Key)
+            : ValueEquivalenceComparer.Instance.Equals(x.Keys, y!.Keys);
+
+        public int GetHashCode(Group g) => g.Keys is null ? ValueOps.Hash(g.Key) : ValueEquivalenceComparer.Instance.GetHashCode(g.Keys);
+    }
+
+    /// <summary>The only aggregate is count(x) or count(*) without DISTINCT: groups just count.</summary>
+    private readonly bool _countOnly = aggs is [{ Kind: AggKind.Count or AggKind.CountStar, Distinct: false }];
 
     /// <summary>
     /// Scan at the bottom of the input when the input is a chain of row-local operators: its id space can then
@@ -292,58 +326,128 @@ internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEval
         return null;
     }
 
-    /// <summary>Groups computed over (a part of) the input, in order of first appearance.</summary>
+    /// <summary>
+    /// Slots read by the grouping keys, when the keys are deterministic functions of them and the input performs no
+    /// writes: consecutive rows with the same values there (an expansion emits the rows of one node together)
+    /// belong to the same group, found without evaluating the keys or hashing them.
+    /// </summary>
+    private readonly int[]? _keyDeps = keyDeps is not null && !Writes(input) ? keyDeps : null;
+
+    private static bool Writes(Operator op) =>
+        op is CreateOp or MergeOp or SetOp or DeleteOp or ForeachOp or ProcedureCallOp || op.Children.Any(Writes);
+
+    /// <summary>
+    /// Groups computed over (a part of) the input. A hash set without removals enumerates in insertion order,
+    /// so <see cref="Groups"/> lists the groups in order of first appearance.
+    /// </summary>
     private sealed class Partial
     {
-        public readonly List<(Value[] Key, Group G)> Order = new();
-        public Dictionary<Value[], Group>? Groups;
+        public HashSet<Group>? Groups;
         public Group? Single;
     }
 
-    private Aggregator[] NewAggs(ExecContext ctx)
+    /// <summary>A group with the key of <paramref name="probe"/>.</summary>
+    private Group NewGroup(Group probe, ExecContext ctx)
     {
-        var a = new Aggregator[aggs.Length];
-        for (int i = 0; i < a.Length; i++) a[i] = aggs[i].Create(ctx);
-        return a;
+        var g = new Group
+        {
+            Key = probe.Key,
+            Keys = probe.Keys is null ? null : (Value[])probe.Keys.Clone(),
+            Snapshot = snapshot ? RowOps.Snapshot(ctx.Row) : null,
+        };
+        if (_countOnly) return g;
+        if (aggs.Length == 1) g.Agg = aggs[0].Create(ctx);
+        else
+        {
+            var a = g.Aggs = new Aggregator[aggs.Length];
+            for (int i = 0; i < a.Length; i++) a[i] = aggs[i].Create(ctx);
+        }
+        return g;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Value ArgOf(AggSpec spec, ExecContext ctx) => spec.Kind == AggKind.CountStar ? Value.True : spec.Arg!(ctx);
 
     private void Feed(Group g, ExecContext ctx)
     {
-        for (int i = 0; i < aggs.Length; i++)
+        if (_countOnly)
         {
-            var spec = aggs[i];
-            g.Aggs[i].Add(spec.Kind == AggKind.CountStar ? Value.True : spec.Arg!(ctx));
+            var spec = aggs[0];
+            if (spec.Kind == AggKind.CountStar || !spec.Arg!(ctx).IsNull) g.Count++;
+            return;
+        }
+        if (g.Agg is { } single)
+        {
+            single.Add(ArgOf(aggs[0], ctx));
+            return;
+        }
+        var a = g.Aggs!;
+        for (int i = 0; i < a.Length; i++) a[i].Add(ArgOf(aggs[i], ctx));
+    }
+
+    private static void MergeInto(Group target, Group source)
+    {
+        target.Count += source.Count;
+        if (target.Agg is { } single) single.Merge(source.Agg!);
+        else if (target.Aggs is { } a)
+        {
+            for (int i = 0; i < a.Length; i++) a[i].Merge(source.Aggs![i]);
         }
     }
 
-    private Partial Aggregate(Cursor input, ExecContext ctx)
+    /// <param name="capacity">Expected number of groups.</param>
+    private Partial Aggregate(Cursor input, ExecContext ctx, int capacity = 0)
     {
         var part = new Partial();
         int nk = keyEvals.Length;
+        var probe = new Group { Keys = nk > 1 ? new Value[nk] : null };
         if (nk == 0)
         {
             while (input.Next())
             {
-                part.Single ??= new Group(RowOps.Snapshot(ctx.Row), NewAggs(ctx));
+                part.Single ??= NewGroup(probe, ctx);
                 Feed(part.Single, ctx);
             }
             return part;
         }
-        var groups = part.Groups = new Dictionary<Value[], Group>(ValueEquivalenceComparer.Instance);
-        var probe = new Value[nk];
+        var groups = part.Groups = new HashSet<Group>(capacity, KeyComparer.Instance);
+        var deps = _keyDeps;
+        var last = deps is null ? null : new Value[deps.Length];
+        Group? lastGroup = null;
         while (input.Next())
         {
-            for (int i = 0; i < nk; i++) probe[i] = keyEvals[i](ctx);
-            if (!groups.TryGetValue(probe, out var g))
+            var row = ctx.Row;
+            Group? g = lastGroup;
+            if (g is null || !SameDeps(row, deps!, last!))
             {
-                var key = (Value[])probe.Clone();
-                g = new Group(RowOps.Snapshot(ctx.Row), NewAggs(ctx));
-                groups[key] = g;
-                part.Order.Add((key, g));
+                if (nk == 1) probe.Key = keyEvals[0](ctx);
+                else
+                {
+                    for (int i = 0; i < nk; i++) probe.Keys![i] = keyEvals[i](ctx);
+                }
+                if (!groups.TryGetValue(probe, out g)) groups.Add(g = NewGroup(probe, ctx));
+                if (deps != null)
+                {
+                    for (int i = 0; i < deps.Length; i++) last![i] = row[deps[i]];
+                    lastGroup = g;
+                }
             }
             Feed(g, ctx);
         }
         return part;
+    }
+
+    /// <summary>Identity (not equivalence) of the slot values: a false negative only costs a regular lookup.</summary>
+    private static bool SameDeps(Value[] row, int[] deps, Value[] last)
+    {
+        for (int i = 0; i < deps.Length; i++)
+        {
+            ref readonly var a = ref row[deps[i]];
+            ref readonly var b = ref last[i];
+            if (a.Kind != b.Kind || a.Num != b.Num) return false;
+            if (!ReferenceEquals(a.Obj, b.Obj) && a.Kind is not (ValueKind.Node or ValueKind.Relationship)) return false;
+        }
+        return true;
     }
 
     /// <summary>Number of workers worth using for this execution (1 = sequential).</summary>
@@ -367,67 +471,76 @@ internal sealed class AggregateOp(Operator input, int[] keySlots, Eval[] keyEval
         int chunks = (int)((high + size - 1) / size);
         var parts = new Partial[chunks];
         var leaf = _parallelLeaf!;
+        int hint = 0; // groups of the last chunk aggregated: ranges of the same size tend to have as many
         try
         {
             Parallel.For(0, chunks, new ParallelOptions { MaxDegreeOfParallelism = workers }, i =>
             {
                 var w = ctx.ForPartition(leaf, i * size, (i + 1) * size);
-                parts[i] = Aggregate(Input.Open(w), w);
+                var p = parts[i] = Aggregate(Input.Open(w), w, Volatile.Read(ref hint));
+                if (p.Groups != null) Volatile.Write(ref hint, p.Groups.Count);
             });
         }
         catch (AggregateException ae)
         {
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
         }
-        var result = new Partial { Groups = keyEvals.Length == 0 ? null : new Dictionary<Value[], Group>(ValueEquivalenceComparer.Instance) };
-        foreach (var p in parts)
+        var result = new Partial();
+        if (keyEvals.Length == 0)
         {
-            if (p.Single != null)
+            foreach (var p in parts)
             {
+                if (p.Single is null) continue;
                 if (result.Single is null) result.Single = p.Single;
                 else MergeInto(result.Single, p.Single);
             }
-            foreach (var (key, g) in p.Order)
+            return result;
+        }
+        // the sum of the partial counts bounds the result (no resizing), and the input rows bound the sum
+        int total = 0;
+        foreach (var p in parts) total += p.Groups!.Count;
+        var groups = result.Groups = new HashSet<Group>(total, KeyComparer.Instance);
+        foreach (var p in parts)
+        {
+            foreach (var g in p.Groups!)
             {
-                if (result.Groups!.TryGetValue(key, out var existing)) MergeInto(existing, g);
-                else
-                {
-                    result.Groups[key] = g;
-                    result.Order.Add((key, g));
-                }
+                if (!groups.Add(g) && groups.TryGetValue(g, out var existing)) MergeInto(existing, g);
             }
         }
         return result;
     }
 
-    private static void MergeInto(Group target, Group source)
-    {
-        for (int i = 0; i < target.Aggs.Length; i++) target.Aggs[i].Merge(source.Aggs[i]);
-    }
-
     private sealed class C(AggregateOp op, Cursor input, ExecContext ctx) : Cursor
     {
-        private List<(Value[] Key, Group G)>? _out;
-        private int _pos;
+        private IEnumerator<Group>? _out;
 
         private void Run()
         {
             int workers = op.Workers(ctx);
             var part = workers > 1 ? op.AggregateParallel(ctx, workers) : op.Aggregate(input, ctx);
-            _out = part.Order;
-            if (op.keyEvals.Length == 0) _out.Add(([], part.Single ?? new Group(null!, op.NewAggs(ctx))));
+            _out = op.keyEvals.Length == 0
+                ? Enumerable.Repeat(part.Single ?? op.NewGroup(new Group(), ctx), 1).GetEnumerator()
+                : part.Groups!.GetEnumerator();
         }
 
         public override bool Next()
         {
             if (_out is null) Run();
-            if (_pos >= _out!.Count) return false;
-            var (key, g) = _out[_pos];
-            _out[_pos++] = default;
+            if (!_out!.MoveNext()) return false;
+            var g = _out.Current;
             var row = ctx.Row;
             if (g.Snapshot != null) RowOps.Restore(g.Snapshot, row);
-            for (int i = 0; i < key.Length; i++) row[op.keySlots[i]] = key[i];
-            for (int i = 0; i < op.aggs.Length; i++) row[op.aggs[i].Slot] = g.Aggs[i].Result();
+            if (g.Keys is { } keys)
+            {
+                for (int i = 0; i < keys.Length; i++) row[op.keySlots[i]] = keys[i];
+            }
+            else if (op.keySlots.Length == 1) row[op.keySlots[0]] = g.Key;
+            if (op._countOnly) row[op.aggs[0].Slot] = Value.FromInt(g.Count);
+            else if (g.Agg is { } single) row[op.aggs[0].Slot] = single.Result();
+            else
+            {
+                for (int i = 0; i < op.aggs.Length; i++) row[op.aggs[i].Slot] = g.Aggs![i].Result();
+            }
             return true;
         }
     }

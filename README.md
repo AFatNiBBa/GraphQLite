@@ -242,7 +242,7 @@ default, e lo stesso Neo4j embedded in Java), stessi dati e stesse query, tutto 
 | `shortestPath` | ~19 k/s | ~11 k/s | ~2,7 k/s | ~0,8 k/s |
 | scan per label + group by | 5,7 ms | 18 ms | 4,4 ms | 40 ms |
 | espansione di 1M relazioni + filtro | 33 ms | 110 ms | 18–20 ms | 257 ms |
-| grado entrante + top-5 (200k gruppi) | 174 ms | **117 ms** | 84–139 ms | 268 ms |
+| grado entrante + top-5 (200k gruppi) | 20–42 ms | 117 ms | 30 ms | 268 ms |
 | update con fsync, 1 client | ~1,8 k/s | ~1,1 k/s | ~1,0 k/s | ~0,5 k/s |
 | update con fsync, molti client | ~13,5–15,5 k/s | ~11–15,5 k/s | ~11,7 k/s | ~5,6 k/s |
 
@@ -252,8 +252,7 @@ default, e lo stesso Neo4j embedded in Java), stessi dati e stesse query, tutto 
   Neo4j, con lo stesso driver.
 - Il runtime parallelo di Neo4j Enterprise (`CYPHER runtime=parallel`) migliora le query analitiche via server del
   10–40%, senza cambiare il quadro.
-- Neo4j resta più veloce sull'aggregazione con molti gruppi in-process (117 ms contro 118–174 ms), e con il group
-  commit gli update con fsync e molti client in-process sono alla pari.
+- Con il group commit gli update con fsync e molti client in-process sono alla pari.
 
 ## openCypher supportato
 
