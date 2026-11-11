@@ -1,8 +1,15 @@
+
+# C#
 bin/
 obj/
 .vs/
 *.user
 TestResults/
+
+# GraphQLite
 *.gdb
 *.gdb-wal
 *.gdb-tmp
+
+# Claude
+.playwright-mcp/
