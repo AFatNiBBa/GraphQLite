@@ -1,6 +1,8 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/GraphQLite/GraphQLite.csproj" />
+    <Project Path="src/GraphQLite.Core/GraphQLite.Core.csproj" />
+    <Project Path="src/GraphQLite.Cypher/GraphQLite.Cypher.csproj" />
     <Project Path="src/GraphQLite.Server/GraphQLite.Server.csproj" />
   </Folder>
   <Folder Name="/tests/">

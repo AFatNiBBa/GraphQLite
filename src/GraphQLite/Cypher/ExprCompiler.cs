@@ -85,7 +85,11 @@ internal sealed partial class Planner
             case LabelCheckExpr lc:
                 {
                     var t = Compile(lc.Target, s);
-                    if (lc.Expression is { } lexpr) return ctx => ExprOps.LabelExpr(ctx, t(ctx), lexpr);
+                    if (lc.Expression is { } lexpr)
+                    {
+                        var matcher = LabelMatcher.Compile(lexpr);
+                        return ctx => ExprOps.LabelExpr(ctx, t(ctx), matcher);
+                    }
                     var labels = lc.Labels.Select(l => new TokenRef(l, TokenKind.Label)).ToArray();
                     return ctx => ExprOps.HasLabels(ctx, t(ctx), labels);
                 }

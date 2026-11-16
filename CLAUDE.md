@@ -28,8 +28,10 @@ Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'
   - `BTree.cs`: chiavi order-preserving (`IndexKeys`) e B+tree
   - `HashIndex.cs`: indice hash (linear hashing) affiancato al B+tree degli indici unique
   - `RwLock.cs`: lock lettori/scrittore usato **solo** per l'esclusività del checkpoint. I lettori stanno su contatori per core distanti 128 byte (un contatore unico costava circa un terzo del throughput a 24 thread); un lettore può decrementare un contatore diverso da quello incrementato (cambio di core), quindi conta solo la somma. Ordine Dekker: lettore incrementa poi legge il flag, checkpoint alza il flag poi somma; lo stress test `RwLock_Never_Lets_A_Writer_In_With_Readers_Inside` deve restare verde
-- `src/GraphQLite/Values`: `Value` (struct da 24 byte), `ValueOps` (uguaglianza, hash, ordinamento), `Temporal`, `Json`, `Entities` (`Node`, `Relationship`, `GraphPath`)
-- `src/GraphQLite/Cypher`: `Lexer`, `Parser`, `Ast`, `Planner`, `ExprCompiler` (espressioni → closure)
+- Tre assembly della libreria: `GraphQLite.Core` ← `GraphQLite.Cypher` ← `GraphQLite` (il motore referenzia entrambi). Namespace invariati (`GraphQLite`, `GraphQLite.Cypher`). Il JIT fa inlining anche tra assembly: separare `Value` non ha cambiato il benchmark
+- `src/GraphQLite.Core` (modello dei valori, nessuna dipendenza): `Value` (struct da 24 byte), `ValueOps` (uguaglianza, hash, ordinamento), `Temporal`, `Json`, `Entities` (`Node`, `Relationship`, `GraphPath`) e tutte le eccezioni. I suoi `internal` sono visibili a motore, parser, server e test (`InternalsVisibleTo`)
+- `src/GraphQLite.Cypher` (parser, dipende solo da Core): `Lexer` (internal), `Parser`, `Ast`. AST e `Parser` sono **pubblici ma non stabili**: l'utente non vuole preoccuparsi dei breaking change. I letterali dell'AST sono già `Value`; l'AST non accede allo store: le label expression si valutano con `Runtime/LabelMatcher` (compilato dall'AST)
+- `src/GraphQLite/Cypher`: `Planner`, `ExprCompiler` (espressioni → closure)
 - `src/GraphQLite/Runtime`: operatori pull (`ReadOperators`, `WriteOperators`, `LoadCsv`), `Functions`, `Aggregation`, `Procedures`, `Core` (`ExecContext`)
 - `GraphDatabase.cs` (apertura, opzioni, cache dei piani, checkpoint), `Transaction.cs`, `QueryResult.cs`
 - `GraphDatabase.cs` / `Transaction.cs` / `QueryCursor.cs`: `Execute` materializza passando da `QueryCursor` (streaming); `StatementLog` registra le query delle transazioni concorrenti

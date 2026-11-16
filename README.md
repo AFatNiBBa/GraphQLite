@@ -37,7 +37,9 @@ using (var cursor = db.Stream("MATCH (p:Person) RETURN p.name AS name"))  // rig
 
 | Percorso | Contenuto |
 |---|---|
-| `src/GraphQLite` | la libreria |
+| `src/GraphQLite` | la libreria (il motore del database) |
+| `src/GraphQLite.Cypher` | il parser openCypher, usabile anche da solo: `Parser.Parse(testo)` restituisce l'albero sintattico (`Statement`, clausole, espressioni) senza dipendere dal database. API pubblica ma non stabile |
+| `src/GraphQLite.Core` | il modello dei valori condiviso da parser e motore: `Value`, tipi temporali, nodi / relazioni / percorsi, eccezioni |
 | `src/GraphQLite.Server` | server **Bolt** (`bolt://` / `neo4j://`) da avviare su una directory del database |
 | `tests/GraphQLite.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità, server Bolt con il driver ufficiale Neo4j |
 | `tools/GraphQLite.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphQLite.Shell -- mydb`) |

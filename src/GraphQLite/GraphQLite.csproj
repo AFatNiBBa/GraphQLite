@@ -17,6 +17,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\GraphQLite.Core\GraphQLite.Core.csproj" />
+    <ProjectReference Include="..\GraphQLite.Cypher\GraphQLite.Cypher.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="GraphQLite.Tests" />
     <InternalsVisibleTo Include="GraphQLite.Server" />
   </ItemGroup>
