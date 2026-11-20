@@ -231,6 +231,19 @@ internal sealed class PageTable<T>
 /// <item>checkpoint copies the newest versions into the base (memory-mapped files) and truncates the WAL.</item>
 /// </list>
 /// </summary>
+/// <summary>Asynchronous wait of the group commit (<see cref="Pager.WaitDurableAsync"/>): <c>await</c> is not allowed in the unsafe <see cref="Pager"/>.</summary>
+internal static class GroupCommit
+{
+    public static async ValueTask WaitAsync(Pager pager, long seq)
+    {
+        while (!pager.DurableStep(seq, out var running, out long target))
+        {
+            if (running != null) await running.ConfigureAwait(false);
+            else pager.SyncAsLeader(target);
+        }
+    }
+}
+
 internal sealed unsafe class Pager : IDisposable
 {
     public readonly SegmentedSpace[] Spaces;
@@ -244,6 +257,8 @@ internal sealed unsafe class Pager : IDisposable
     private readonly bool _groupSync;
     private readonly object _syncLock = new();
     private bool _syncing;
+    /// <summary>Completed when the running fsync ends: what <see cref="WaitDurableAsync"/> waits on (created lazily).</summary>
+    private TaskCompletionSource? _syncDone;
     private long _syncs;
 
     /// <summary>Number of group-commit fsyncs so far (tests).</summary>
@@ -353,39 +368,72 @@ internal sealed unsafe class Pager : IDisposable
     public void WaitDurable(long seq)
     {
         if (!_groupSync || Volatile.Read(ref _visibleSeq) >= seq) return;
-        Monitor.Enter(_syncLock);
+        while (true)
+        {
+            long target;
+            lock (_syncLock)
+            {
+                while (_syncing && _visibleSeq < seq) Monitor.Wait(_syncLock);
+                if (_visibleSeq >= seq) return;
+                _syncing = true;
+                target = Volatile.Read(ref _committedSeq); // every frame up to here is fully written
+            }
+            SyncAsLeader(target);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="WaitDurable"/> that does not block a thread while another caller's fsync is running: with many
+    /// concurrent committers only the leader's thread is busy (in the fsync itself, which has no asynchronous API).
+    /// </summary>
+    public ValueTask WaitDurableAsync(long seq) =>
+        !_groupSync || Volatile.Read(ref _visibleSeq) >= seq ? ValueTask.CompletedTask : GroupCommit.WaitAsync(this, seq);
+
+    /// <summary>
+    /// One step of <see cref="WaitDurableAsync"/>: true when <paramref name="seq"/> is durable; otherwise either
+    /// <paramref name="running"/> is the fsync in progress to wait for, or the caller became the leader and must call
+    /// <see cref="SyncAsLeader"/> with <paramref name="target"/>.
+    /// </summary>
+    internal bool DurableStep(long seq, out Task? running, out long target)
+    {
+        running = null;
+        target = 0;
+        lock (_syncLock)
+        {
+            if (_visibleSeq >= seq) return true;
+            if (_syncing) running = (_syncDone ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            else
+            {
+                _syncing = true;
+                target = Volatile.Read(ref _committedSeq);
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Fsyncs the WAL up to <paramref name="target"/> and wakes the waiters (caller set <see cref="_syncing"/>).</summary>
+    internal void SyncAsLeader(long target)
+    {
+        bool synced = false;
         try
         {
-            while (_visibleSeq < seq)
-            {
-                if (_syncing)
-                {
-                    Monitor.Wait(_syncLock);
-                    continue;
-                }
-                _syncing = true;
-                long target = Volatile.Read(ref _committedSeq); // every frame up to here is fully written
-                Monitor.Exit(_syncLock);
-                bool synced = false;
-                try
-                {
-                    BeforeGroupSync?.Invoke();
-                    _wal!.Sync();
-                    Interlocked.Increment(ref _syncs);
-                    synced = true;
-                }
-                finally
-                {
-                    Monitor.Enter(_syncLock);
-                    _syncing = false;
-                    if (synced && target > _visibleSeq) Volatile.Write(ref _visibleSeq, target);
-                    Monitor.PulseAll(_syncLock); // after publishing: woken waiters see the new visible seq
-                }
-            }
+            BeforeGroupSync?.Invoke();
+            _wal!.Sync();
+            Interlocked.Increment(ref _syncs);
+            synced = true;
         }
         finally
         {
-            Monitor.Exit(_syncLock);
+            TaskCompletionSource? done;
+            lock (_syncLock)
+            {
+                _syncing = false;
+                if (synced && target > _visibleSeq) Volatile.Write(ref _visibleSeq, target);
+                Monitor.PulseAll(_syncLock); // after publishing: woken waiters see the new visible seq
+                done = _syncDone;
+                _syncDone = null;
+            }
+            done?.SetResult(); // asynchronous waiters (they re-check, and one of them may lead the next fsync)
         }
     }
 

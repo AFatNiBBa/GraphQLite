@@ -100,6 +100,12 @@ Un database è una **directory**:
   stessa transazione mette da parte le righe non ancora lette; chiudere il cursore prima della fine ferma una lettura,
   mentre una query di scrittura viene comunque completata. Con `db.Stream` una query di scrittura tiene il turno di
   scrittura finché il cursore non viene chiuso.
+- **Metodi async per le scritture**: `db.ExecuteAsync`, `db.BeginTransactionAsync` e `tx.CommitAsync` aspettano il
+  turno degli altri scrittori e, con `SyncMode.Full`, il fsync del commit **senza bloccare un thread**: con tanti
+  scrittori concorrenti (per esempio un'applicazione ASP.NET) i thread fermi in attesa non esauriscono il thread pool.
+  Con molti commit in attesa dello stesso fsync, è occupato solo il thread che lo esegue. Le query invece girano in
+  modo sincrono, perché sono lavoro di CPU su file mappati in memoria: per questo non esistono versioni async delle
+  letture, e `ExecuteAsync` di una query di sola lettura completa subito.
 - Il **checkpoint** (automatico oltre `CheckpointThresholdBytes`, 256 MB, oppure con `db.Checkpoint()`) copia le versioni più
   recenti nei file mappati, li sincronizza su disco e tronca il WAL. Esclude i lettori solo per il tempo della copia in
   memoria.

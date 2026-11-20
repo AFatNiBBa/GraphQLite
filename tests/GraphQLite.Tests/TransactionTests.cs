@@ -9,6 +9,44 @@ public class TransactionTests : IDisposable
 
     private long Count(string q) => _db.ExecuteScalar<long>(q);
 
+    // ------------------------------------------------------------------ async writers
+
+    [Fact]
+    public async Task Async_Writers_Wait_For_The_Writer_Gate_Without_Blocking()
+    {
+        var held = _db.BeginTransaction(); // holds the writer gate
+        held.Execute("CREATE (:A)");
+        // all from this thread: nothing blocks while the gate is taken
+        var begin = _db.BeginTransactionAsync();
+        var write = _db.ExecuteAsync("CREATE (b:B) RETURN 7 AS x");
+        using var cts = new CancellationTokenSource();
+        var cancelled = _db.ExecuteAsync("CREATE (:C)", null, cts.Token);
+        var concurrent = _db.BeginConcurrentTransaction();
+        concurrent.Execute("CREATE (:D)");
+        var commit = concurrent.CommitAsync();
+        var read = _db.ExecuteAsync("MATCH (n) RETURN count(n)");
+        Assert.True(read.IsCompletedSuccessfully); // reads never wait
+        Assert.Equal(0L, (await read).Scalar<long>());
+        Assert.False(begin.IsCompleted);
+        Assert.False(write.IsCompleted);
+        Assert.False(commit.IsCompleted);
+
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await cancelled);
+        held.Commit();
+        using (var tx = await begin)
+        {
+            tx.Execute("CREATE (:E)");
+            await tx.CommitAsync();
+        }
+        Assert.Equal(7L, (await write).Scalar<long>());
+        await commit; // replayed after the others: CREATE does not conflict
+        Assert.Equal(["A", "B", "D", "E"], _db.Execute("MATCH (n) RETURN labels(n)[0] AS l ORDER BY l").Select(r => r.Get<string>(0)));
+        // the gate is free again (the cancelled writer did not keep it)
+        await _db.ExecuteAsync("CREATE (:F)");
+        Assert.Equal(5L, Count("MATCH (n) RETURN count(n)"));
+    }
+
     // ------------------------------------------------------------------ streaming
 
     [Fact]

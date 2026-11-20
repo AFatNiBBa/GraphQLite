@@ -210,6 +210,46 @@ public class StorageTests : IDisposable
     }
 
     [Fact]
+    public async Task Async_Commits_Wait_For_The_Fsync_Without_Blocking_The_Thread()
+    {
+        using var db = GraphDatabase.Open(DbPath, new DatabaseOptions { Sync = SyncMode.Full });
+        db.Execute("CREATE (:Seed)");
+        using var inSync = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        db.Store.Pager.BeforeGroupSync = () => { inSync.Set(); release.Wait(); };
+        long before = db.Store.Pager.GroupSyncs;
+        var leader = Task.Run(() => db.Execute("CREATE (:X {v: 0})"));
+        try
+        {
+            Assert.True(inSync.Wait(5000)); // the leader's fsync is stuck
+            // all from this thread: each commit is written, then waits for the fsync without blocking
+            var pending = new List<ValueTask<QueryResult>>();
+            for (int i = 1; i <= 50; i++)
+                pending.Add(db.ExecuteAsync("CREATE (:X {v: $v})", new Dictionary<string, object?> { ["v"] = i }));
+            var tx = await db.BeginTransactionAsync();
+            tx.Execute("CREATE (:X {v: 51})");
+            var commit = tx.CommitAsync();
+            Assert.All(pending, p => Assert.False(p.IsCompleted));
+            Assert.False(commit.IsCompleted);
+            Assert.Equal(0L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>()); // not durable: not visible
+
+            db.Store.Pager.BeforeGroupSync = null;
+            release.Set();
+            await leader;
+            foreach (var p in pending) await p;
+            await commit;
+        }
+        finally
+        {
+            db.Store.Pager.BeforeGroupSync = null;
+            release.Set();
+        }
+        Assert.Equal(52L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>());
+        long syncs = db.Store.Pager.GroupSyncs - before;
+        Assert.True(syncs <= 3, $"{syncs} fsyncs"); // the stuck one, then one for all the waiters
+    }
+
+    [Fact]
     public async Task Group_Commit_Hides_Commits_Until_They_Are_Durable()
     {
         using var db = GraphDatabase.Open(DbPath, new DatabaseOptions { Sync = SyncMode.Full });

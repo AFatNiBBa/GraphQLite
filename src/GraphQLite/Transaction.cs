@@ -190,6 +190,35 @@ public sealed class Transaction : IDisposable
     /// </summary>
     public void Commit()
     {
+        if (!BeginCommit()) return;
+        if (_concurrent) _db.WriterGate.Wait();
+        long seq = CommitUnderGate(out var error);
+        // group commit: wait for the fsync outside the gate, so the next writers can join it
+        if (seq >= 0) _db.Store.Pager.WaitDurable(seq);
+        error?.Throw();
+    }
+
+    /// <summary>
+    /// <see cref="Commit"/> that does not block the thread while waiting: a concurrent transaction waits for the
+    /// writer gate asynchronously, and with <see cref="SyncMode.Full"/> the commit waits for the fsync (group commit)
+    /// asynchronously. The rest (writing the WAL, a replay) runs synchronously.
+    /// </summary>
+    public async ValueTask CommitAsync()
+    {
+        if (!BeginCommit()) return;
+        if (_concurrent) await _db.WriterGate.WaitAsync().ConfigureAwait(false);
+        long seq = CommitUnderGate(out var error);
+        if (seq >= 0) await _db.Store.Pager.WaitDurableAsync(seq).ConfigureAwait(false);
+        error?.Throw();
+    }
+
+    /// <summary>
+    /// First part of a commit: ends the open statement and the transaction. False when nothing is left to do (a
+    /// read-only transaction, or a concurrent one that wrote nothing); otherwise the caller must take the writer gate
+    /// (exclusive transactions already hold it) and call <see cref="CommitUnderGate"/>.
+    /// </summary>
+    private bool BeginCommit()
+    {
         ObjectDisposedException.ThrowIf(_finished, this);
         var open = _open;
         _open = null;
@@ -198,71 +227,56 @@ public sealed class Transaction : IDisposable
         if (IsReadOnly)
         {
             _db.Lock.ExitRead();
-            return;
+            return false;
         }
         if (_concurrent)
         {
-            CommitConcurrent();
-            return;
+            // the snapshot is no longer needed: under the gate nobody else commits, and private pages are copies
+            _db.Lock.ExitRead();
+            if (Store.W!.DirtyCount == 0)
+            {
+                Store.Abort(); // only reads: serializable at its snapshot
+                return false;
+            }
         }
+        return true;
+    }
+
+    /// <summary>
+    /// Commits under the writer gate and releases it. Returns the sequence to wait for (durability), or -1 when the
+    /// commit failed; <paramref name="error"/> is a failure after the commit (a checkpoint), to throw after waiting.
+    /// </summary>
+    private long CommitUnderGate(out System.Runtime.ExceptionServices.ExceptionDispatchInfo? error)
+    {
+        error = null;
         long seq = -1;
+        bool aborted = false;
         try
         {
-            Store.Commit();
+            if (_concurrent && _db.Store.Pager.CommittedSeq != Store.Snapshot)
+            {
+                Store.Abort();
+                aborted = true;
+                Replay();
+            }
+            else Store.Commit();
             seq = _db.Store.Pager.CommittedSeq;
             _db.AfterCommit();
         }
+        catch (Exception ex) when (seq >= 0)
+        {
+            error = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+        }
         catch
         {
-            if (seq < 0) Store.Abort();
+            if (!aborted) Store.Abort();
             throw;
         }
         finally
         {
             _db.WriterGate.Release();
-            // group commit: wait for the fsync outside the gate, so the next writers can join it
-            if (seq >= 0) _db.Store.Pager.WaitDurable(seq);
         }
-    }
-
-    private void CommitConcurrent()
-    {
-        // the snapshot is no longer needed: under the gate nobody else commits, and private pages are copies
-        _db.Lock.ExitRead();
-        if (Store.W!.DirtyCount == 0)
-        {
-            Store.Abort(); // only reads: serializable at its snapshot
-            return;
-        }
-        _db.WriterGate.Wait();
-        long seq = -1;
-        try
-        {
-            if (_db.Store.Pager.CommittedSeq == Store.Snapshot)
-            {
-                try
-                {
-                    Store.Commit();
-                }
-                catch
-                {
-                    Store.Abort();
-                    throw;
-                }
-            }
-            else
-            {
-                Store.Abort();
-                Replay();
-            }
-            seq = _db.Store.Pager.CommittedSeq;
-            _db.AfterCommit();
-        }
-        finally
-        {
-            _db.WriterGate.Release();
-            if (seq >= 0) _db.Store.Pager.WaitDurable(seq);
-        }
+        return seq;
     }
 
     /// <summary>Re-executes the statements on the latest state (caller holds the writer gate).</summary>
