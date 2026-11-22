@@ -3,7 +3,7 @@
 Graph database **embedded** (in-process, come SQLite) per .NET 10, interrogabile in **openCypher**.
 Obiettivo dichiarato dall'utente: **il più veloce possibile**, sfruttando le funzionalità moderne di .NET (`Span`, `unsafe`, SIMD, memory-mapped file), con **letture concorrenti illimitate** e grafi più grandi della RAM.
 Il `README.md` (in italiano) descrive funzionalità, prestazioni e limiti per l'utente finale: tenerlo allineato quando cambiano.
-Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'utente; la directory del repository è ancora `gdb`). Restano col vecchio nome, apposta, il magic su disco `"\0GRPGDB3"` in `Header` (cambiarlo renderebbe illeggibili i database esistenti) e il prefisso `GB:` dei bookmark Bolt.
+Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'utente). Restano col vecchio nome, apposta, il magic su disco `"\0GRPGDB3"` in `Header` (cambiarlo renderebbe illeggibili i database esistenti) e il prefisso `GB:` dei bookmark Bolt.
 
 ## Stack
 - .NET 10, C# `latest`, `AllowUnsafeBlocks`, `IsAotCompatible`, `InvariantGlobalization`, nessuna dipendenza esterna nella libreria
@@ -85,6 +85,7 @@ Il progetto si chiamava **GraphDb** (rinominato in GraphQLite su richiesta dell'
 ## Come lavorare
 - Git lo gestisce l'utente: niente commit, cambi di branch o merge se non richiesti
 - I fine riga (CRLF su disco) li gestisce git: non serve preoccuparsene né verificarli
+- I **database di test** (server di prova, shell, benchmark su disco) vanno in `.data` nella radice del repository (richiesta dell'utente), mai fuori dal progetto o nello scratchpad. `.data` è già il database di prova dell'utente, con i suoi dati e la chiave TLS: non svuotarlo né sovrascriverlo, e per un database usa e getta usare una sottodirectory (`.data/<nome>`). È ignorata da git e deve restarlo. I test xUnit continuano a usare memoria e directory temporanee
 - Un server avviato da `src/GraphQLite.Server/bin` blocca le DLL e fa fallire la build: per tenerlo acceso mentre si lavora, avviarlo da una copia della cartella di output nello scratchpad
 - Neo4j Browser si prova con il server MCP Playwright (`.mcp.json`, Edge): per il certificato self-signed usare una sessione CDP con `Security.setIgnoreCertificateErrors` (da `browser_run_code_unsafe`), poi `https://browser.neo4j.io/?connectURL=neo4j%2Bs://localhost:7687`; senza autenticazione sul server va bene qualsiasi password
 - Gli script Python passati a Git Bash con un heredoc si rompono se contengono apostrofi (`l'indirizzo`): scriverli in un file nello scratchpad con il tool Write
