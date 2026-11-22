@@ -1,7 +1,7 @@
 namespace GraphQLite.Cypher;
 
 /// <summary>Recursive-descent parser for openCypher.</summary>
-internal sealed class Parser
+public sealed class Parser
 {
     private readonly string _src;
     private readonly List<Tok> _toks;

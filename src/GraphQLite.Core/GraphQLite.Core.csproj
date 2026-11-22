@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>GraphQLite</RootNamespace>
+    <AssemblyName>GraphQLite.Core</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Version>0.1.0</Version>
+    <Description>Value model shared by the GraphQLite parser and engine: Value, temporal types, graph entities, exceptions.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="GraphQLite" />
+    <InternalsVisibleTo Include="GraphQLite.Cypher" />
+    <InternalsVisibleTo Include="GraphQLite.Server" />
+    <InternalsVisibleTo Include="GraphQLite.Tests" />
+  </ItemGroup>
+
+</Project>

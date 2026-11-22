@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using GraphQLite.Storage;
+
 namespace GraphQLite.Tests;
 
 public class StorageTests : IDisposable
@@ -84,6 +87,198 @@ public class StorageTests : IDisposable
         }
         using (db = GraphDatabase.Open(DbPath))
             Assert.Equal(2, db.NodeCount);
+    }
+
+    /// <summary>Start offsets of the frames of the WAL (24-byte header, body length at offset 20).</summary>
+    private static List<int> WalFrames(byte[] wal)
+    {
+        var frames = new List<int>();
+        for (int p = 0; p + 24 <= wal.Length; p += 24 + BinaryPrimitives.ReadInt32LittleEndian(wal.AsSpan(p + 20))) frames.Add(p);
+        return frames;
+    }
+
+    [Fact]
+    public void Wal_Frame_With_A_Corrupted_Page_Count_Is_Discarded()
+    {
+        var db = GraphDatabase.Open(DbPath);
+        db.Execute("CREATE (:A)");
+        db.Execute("CREATE (:B)");
+        db.SimulateCrash();
+        var wal = File.ReadAllBytes(WalPath);
+        int last = WalFrames(wal)[^1];
+        wal[last + 4]++; // the page count is covered by the CRC
+        File.WriteAllBytes(WalPath, wal);
+        using (db = GraphDatabase.Open(DbPath))
+        {
+            Assert.Equal(1, db.NodeCount);
+            Assert.Equal(1L, db.Execute("MATCH (a:A) RETURN count(a)").Scalar<long>());
+        }
+    }
+
+    [Fact]
+    public void Wal3_Frames_Are_Still_Replayed()
+    {
+        var db = GraphDatabase.Open(DbPath);
+        db.Execute("CREATE (:A)");
+        db.Execute("CREATE (:B)");
+        db.Execute("CREATE (:C)");
+        db.SimulateCrash();
+        // rewrite every frame in the previous format: magic "WAL3", CRC over seq, body length and body
+        var wal = File.ReadAllBytes(WalPath);
+        var frames = WalFrames(wal);
+        foreach (int f in frames)
+        {
+            var header = wal.AsSpan(f, 24);
+            BinaryPrimitives.WriteUInt32LittleEndian(header, 0x334C4157);
+            uint crc = CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8));
+            crc = CrcStream.Update(crc, header.Slice(20, 4));
+            crc = CrcStream.Update(crc, wal.AsSpan(f + 24, BinaryPrimitives.ReadInt32LittleEndian(header[20..])));
+            BinaryPrimitives.WriteUInt32LittleEndian(header[16..], ~crc);
+        }
+        // in WAL3 the page count is not checksummed: a wrong one must be caught by the body validation
+        wal[frames[^1] + 4]++;
+        File.WriteAllBytes(WalPath, wal);
+        using (db = GraphDatabase.Open(DbPath))
+        {
+            Assert.Equal(2, db.NodeCount);
+            Assert.Equal(["A", "B"], db.Execute("MATCH (n) RETURN labels(n)[0] ORDER BY labels(n)[0]").Select(r => r.Get<string>(0)));
+            db.Execute("CREATE (:D)");
+        }
+        using (db = GraphDatabase.Open(DbPath))
+            Assert.Equal(3, db.NodeCount);
+    }
+
+    [Fact]
+    public void RwLock_Never_Lets_A_Writer_In_With_Readers_Inside()
+    {
+        using var rw = new RwLock();
+        int inside = 0, writes = 0, violations = 0;
+        bool stop = false;
+        // dedicated threads, not the thread pool: spinning pool threads would starve the tests running in parallel
+        var readers = Enumerable.Range(0, Math.Max(4, Environment.ProcessorCount / 2)).Select(t => new Thread(() =>
+        {
+            var rnd = new Random(t);
+            while (!Volatile.Read(ref stop))
+            {
+                rw.EnterRead();
+                Interlocked.Increment(ref inside);
+                if (rnd.Next(4) == 0) Thread.Yield(); // may resume on another core: exit decrements another counter
+                Interlocked.Decrement(ref inside);
+                rw.ExitRead();
+            }
+        }) { IsBackground = true }).ToArray();
+        foreach (var r in readers) r.Start();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 1500)
+        {
+            bool entered = writes % 2 == 0 ? rw.TryEnterWrite(5) : Enter();
+            if (!entered) continue;
+            if (Volatile.Read(ref inside) != 0) violations++;
+            Thread.SpinWait(200);
+            if (Volatile.Read(ref inside) != 0) violations++;
+            writes++;
+            rw.ExitWrite();
+        }
+        bool Enter() { rw.EnterWrite(); return true; }
+        Volatile.Write(ref stop, true);
+        foreach (var r in readers) r.Join();
+        Assert.Equal(0, violations);
+        Assert.True(writes > 10, $"only {writes} exclusive sections");
+    }
+
+    [Fact]
+    public async Task Group_Commit_Shares_Fsyncs_And_Loses_Nothing()
+    {
+        var opts = new DatabaseOptions { Sync = SyncMode.Full };
+        var db = GraphDatabase.Open(DbPath, opts);
+        db.Execute("CREATE CONSTRAINT FOR (c:C) REQUIRE c.id IS UNIQUE");
+        db.Execute("UNWIND range(0, 15) AS i CREATE (:C {id: i, v: 0})");
+        const int Threads = 16, PerThread = 150;
+        db.Store.Pager.BeforeGroupSync = () => Thread.Sleep(2); // a slow disk: commits pile up behind each fsync
+        long before = db.Store.Pager.GroupSyncs;
+        await Task.WhenAll(Enumerable.Range(0, Threads).Select(t => Task.Run(() =>
+        {
+            for (int i = 0; i < PerThread; i++)
+                db.Execute("MATCH (c:C {id: $id}) SET c.v = c.v + 1", new Dictionary<string, object?> { ["id"] = t });
+        })));
+        long syncs = db.Store.Pager.GroupSyncs - before;
+        db.Store.Pager.BeforeGroupSync = null;
+        Assert.True(syncs < Threads * PerThread / 2, $"{syncs} fsyncs for {Threads * PerThread} commits");
+        db.SimulateCrash(); // no checkpoint: everything comes back from the WAL
+        using (db = GraphDatabase.Open(DbPath, opts))
+            Assert.Equal(Enumerable.Repeat((long)PerThread, Threads), db.Execute("MATCH (c:C) RETURN c.v ORDER BY c.id").Select(r => r.Get<long>(0)));
+    }
+
+    [Fact]
+    public async Task Async_Commits_Wait_For_The_Fsync_Without_Blocking_The_Thread()
+    {
+        using var db = GraphDatabase.Open(DbPath, new DatabaseOptions { Sync = SyncMode.Full });
+        db.Execute("CREATE (:Seed)");
+        using var inSync = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        db.Store.Pager.BeforeGroupSync = () => { inSync.Set(); release.Wait(); };
+        long before = db.Store.Pager.GroupSyncs;
+        var leader = Task.Run(() => db.Execute("CREATE (:X {v: 0})"));
+        try
+        {
+            Assert.True(inSync.Wait(5000)); // the leader's fsync is stuck
+            // all from this thread: each commit is written, then waits for the fsync without blocking
+            var pending = new List<ValueTask<QueryResult>>();
+            for (int i = 1; i <= 50; i++)
+                pending.Add(db.ExecuteAsync("CREATE (:X {v: $v})", new Dictionary<string, object?> { ["v"] = i }));
+            var tx = await db.BeginTransactionAsync();
+            tx.Execute("CREATE (:X {v: 51})");
+            var commit = tx.CommitAsync();
+            Assert.All(pending, p => Assert.False(p.IsCompleted));
+            Assert.False(commit.IsCompleted);
+            Assert.Equal(0L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>()); // not durable: not visible
+
+            db.Store.Pager.BeforeGroupSync = null;
+            release.Set();
+            await leader;
+            foreach (var p in pending) await p;
+            await commit;
+        }
+        finally
+        {
+            db.Store.Pager.BeforeGroupSync = null;
+            release.Set();
+        }
+        Assert.Equal(52L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>());
+        long syncs = db.Store.Pager.GroupSyncs - before;
+        Assert.True(syncs <= 3, $"{syncs} fsyncs"); // the stuck one, then one for all the waiters
+    }
+
+    [Fact]
+    public async Task Group_Commit_Hides_Commits_Until_They_Are_Durable()
+    {
+        using var db = GraphDatabase.Open(DbPath, new DatabaseOptions { Sync = SyncMode.Full });
+        db.Execute("CREATE (:Seed)");
+        using var inSync = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        db.Store.Pager.BeforeGroupSync = () => { inSync.Set(); release.Wait(); };
+
+        var writer = Task.Run(() => db.Execute("CREATE (:X {v: 1})"));
+        Assert.True(inSync.Wait(5000)); // the commit is written, its fsync is stuck
+        // a reader does not see it yet
+        Assert.Equal(0L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>());
+        // an exclusive transaction builds on it, but must not hand its rows out before it is durable
+        var reader = Task.Run(() =>
+        {
+            using var tx = db.BeginTransaction();
+            var r = tx.Execute("MATCH (x:X) RETURN x.v").Select(row => row.Get<long>(0)).ToList();
+            tx.Commit();
+            return r;
+        });
+        await Task.Delay(300);
+        Assert.False(writer.IsCompleted);
+        Assert.False(reader.IsCompleted);
+
+        db.Store.Pager.BeforeGroupSync = null;
+        release.Set();
+        await writer;
+        Assert.Equal([1L], await reader);
+        Assert.Equal(1L, db.Execute("MATCH (x:X) RETURN count(x)").Scalar<long>());
     }
 
     [Fact]

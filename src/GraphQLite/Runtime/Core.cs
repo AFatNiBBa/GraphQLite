@@ -107,10 +107,14 @@ internal sealed class ExecContext
         Cancellation = ct;
     }
 
-    /// <summary>Context of a parallel worker: same snapshot and parameters, private row, scan of <paramref name="leaf"/> restricted to [low, high).</summary>
-    public ExecContext ForPartition(Operator leaf, long low, long high)
+    /// <summary>
+    /// Context of a parallel worker: same snapshot and parameters, private row (a copy of <paramref name="row"/>, or
+    /// of ours), scan of <paramref name="leaf"/> restricted to [low, high). Thread-safe once <see cref="Now"/> and
+    /// <see cref="Seed"/> have been read.
+    /// </summary>
+    public ExecContext ForPartition(Operator leaf, long low, long high, Value[]? row = null, CancellationToken? ct = null)
     {
-        var w = new ExecContext(Store, Row.Length, Params, Options, Cancellation)
+        var w = new ExecContext(Store, Row.Length, Params, Options, ct ?? Cancellation)
         {
             _partitionLeaf = leaf,
             _partitionLow = low,
@@ -118,8 +122,26 @@ internal sealed class ExecContext
             Now = Now,
             Seed = HashCode.Combine(Seed, low),
         };
-        Row.AsSpan().CopyTo(w.Row);
+        (row ?? Row).AsSpan().CopyTo(w.Row);
         return w;
+    }
+
+    /// <summary>Work still running on other threads for this statement (see <see cref="StopBackground"/>).</summary>
+    private List<Action>? _background;
+
+    /// <summary>Registers how to stop work that runs on other threads while the statement is open.</summary>
+    public void OnStop(Action stop) => (_background ??= []).Add(stop);
+
+    /// <summary>
+    /// Stops the work running on other threads and waits for it: called when the statement ends, before its
+    /// transaction can release the snapshot.
+    /// </summary>
+    public void StopBackground()
+    {
+        var b = _background;
+        _background = null;
+        if (b is null) return;
+        foreach (var stop in b) stop();
     }
 
     /// <summary>Node id range that the scan <paramref name="scan"/> must cover in this context.</summary>
@@ -182,6 +204,9 @@ internal abstract class UnaryOperator(Operator input) : Operator
 {
     public readonly Operator Input = input;
     public override IEnumerable<Operator> Children => [Input];
+
+    /// <summary>The same operator over another input, or null when it does not support it (plan rewriting).</summary>
+    public virtual UnaryOperator? WithInput(Operator input) => null;
 }
 
 /// <summary>A node scan whose id space can be split into ranges (<see cref="ExecContext.PartitionOf"/>).</summary>

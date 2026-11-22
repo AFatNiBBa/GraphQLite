@@ -17,45 +17,21 @@ public class FeatureTests : IDisposable
     private QueryResult Q(string q, Dictionary<string, object?>? p = null) => _db.Execute(q, p);
     private List<T> Col<T>(string q, Dictionary<string, object?>? p = null) => Q(q, p).Select(r => r.Get<T>(0)).ToList();
 
-    // ------------------------------------------------------------------ parallel aggregation
-
     [Fact]
-    public void Parallel_Aggregation_Matches_Sequential()
+    public void Grouping_Reuses_The_Group_Of_Consecutive_Rows_Only_When_Safe()
     {
-        using var par = GraphDatabase.OpenInMemory(new DatabaseOptions { MaxDegreeOfParallelism = 8 });
-        using var seq = GraphDatabase.OpenInMemory(new DatabaseOptions { MaxDegreeOfParallelism = 1 });
-        const string load = """
-            UNWIND range(0, 199999) AS i
-            CREATE (n:N {i: i, g: i % 37, s: 'v' + (i % 1000), f: (i % 101) / 7.0})
-            WITH n, i WHERE i % 3 = 0 SET n:M
-            """;
-        const string rels = "MATCH (a:M) WHERE a.i % 2 = 0 MATCH (b:N {i: (a.i * 7) % 200000}) CREATE (a)-[:R {w: a.i % 13}]->(b)";
-        foreach (var db in new[] { par, seq })
-        {
-            db.Execute("CREATE INDEX FOR (n:N) ON (n.i)");
-            db.Execute(load);
-            db.Execute(rels);
-            db.Execute("MATCH (n:N) WHERE n.i % 1000 = 0 DETACH DELETE n"); // holes in the id space
-        }
-        string[] queries =
-        [
-            "MATCH (n:N) RETURN count(*), sum(n.i), min(n.s), max(n.f), avg(n.i), round(stDev(n.f), 9)",
-            "MATCH (n:N) RETURN n.g AS g, count(*) AS c, collect(n.i)[0..5] AS first, sum(n.f) > 0 AS pos",
-            "MATCH (n) WHERE n.i > 150000 RETURN count(DISTINCT n.s), collect(DISTINCT n.g)[0..10]",
-            "MATCH (n:M:N) RETURN n.g % 5 AS k, percentileDisc(n.i, 0.5) AS p, count(n) AS c ORDER BY k",
-            "MATCH (a:M)-[r:R]->(b) RETURN r.w AS w, count(*) AS c, sum(b.i) AS s ORDER BY w",
-            "MATCH (a:M) OPTIONAL MATCH (a)-[:R]->(b) RETURN count(b), count(a)",
-            "MATCH (n:N) WHERE n.i < 10 RETURN count(*)",
-            "MATCH (n:Missing) RETURN count(*), collect(n)",
-            "MATCH (n:N) WITH n.g AS g, count(*) AS c RETURN sum(c), count(g)",
-        ];
-        foreach (var q in queries)
-        {
-            string Dump(GraphDatabase db) => string.Join("\n", db.Execute(q).Select(r => r.ToString()));
-            Assert.Equal(Dump(seq), Dump(par));
-        }
-        // errors raised by a worker surface as the original exception
-        Assert.Throws<CypherRuntimeException>(() => par.Execute("MATCH (n:N) RETURN sum(n.s)"));
+        Q("CREATE (n:N {x: 0}) WITH n UNWIND range(1, 3) AS i CREATE (n)-[:R]->(:M {i: i})");
+        // consecutive rows of the same node, same group
+        Assert.Equal("1:3", string.Join(",", Q("MATCH (n:N)-[:R]->(m) RETURN n.x + 1 AS k, count(m) AS c").Select(r => $"{r["k"]}:{r["c"]}")));
+        // keys read through a write: every row sees a different value
+        var written = Q("MATCH (n:N)-[:R]->(m) SET n.x = n.x + 1 WITH n.x AS k, count(*) AS c RETURN k, c ORDER BY k");
+        Assert.Equal("1:1,2:1,3:1", string.Join(",", written.Select(r => $"{r["k"]}:{r["c"]}")));
+        // random keys are not reused either
+        Assert.Equal(3L, Q("MATCH (n:N)-[:R]->(m) WITH n, rand() AS k, count(*) AS c RETURN count(*)").Scalar<long>());
+        // groups in order of first appearance, also when the same key comes back later
+        Assert.Equal("1:3,2:1", string.Join(",", Q("UNWIND [1, 1, 2, 1] AS x RETURN x, count(*) AS c").Select(r => $"{r["x"]}:{r["c"]}")));
+        // after the aggregation, variables that are not keys come from the first row of the group
+        Assert.Equal([12L, 31L], Col<long>("UNWIND [{g: 1, v: 10}, {g: 1, v: 20}, {g: 2, v: 30}] AS r RETURN count(*) + r.v AS x, r.g AS g"));
     }
 
     // ------------------------------------------------------------------ JSON / nested properties

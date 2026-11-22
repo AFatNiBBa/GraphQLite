@@ -37,19 +37,22 @@ using (var cursor = db.Stream("MATCH (p:Person) RETURN p.name AS name"))  // rig
 
 | Percorso | Contenuto |
 |---|---|
-| `src/GraphQLite` | la libreria |
+| `src/GraphQLite` | la libreria (il motore del database) |
+| `src/GraphQLite.Cypher` | il parser openCypher, usabile anche da solo: `Parser.Parse(testo)` restituisce l'albero sintattico (`Statement`, clausole, espressioni) senza dipendere dal database. API pubblica ma non stabile |
+| `src/GraphQLite.Core` | il modello dei valori condiviso da parser e motore: `Value`, tipi temporali, nodi / relazioni / percorsi, eccezioni |
 | `src/GraphQLite.Server` | server **Bolt** (`bolt://` / `neo4j://`) da avviare su una directory del database |
 | `tests/GraphQLite.Tests` | test xUnit: semantica Cypher, persistenza, crash recovery, concorrenza, nuove funzionalità, server Bolt con il driver ufficiale Neo4j |
 | `tools/GraphQLite.Shell` | shell interattiva stile `sqlite3` (`dotnet run --project tools/GraphQLite.Shell -- mydb`) |
 | `tools/GraphQLite.Bench` | benchmark (`dotnet run -c Release --project tools/GraphQLite.Bench -- 200000 5 [directory]`) |
+| `tools/GraphQLite.Compare` | confronto con Neo4j sulle stesse query: GraphQLite in-process, qualsiasi server Bolt, e (in `neo4j-embedded/`) Neo4j embedded in Java |
 
 ```
 dotnet build GraphQLite.slnx
 dotnet test  GraphQLite.slnx
 ```
 
-I test del server usano il pacchetto `Neo4j.Driver` (solo nel progetto di test: la libreria e il server non hanno
-dipendenze esterne).
+I test del server e `tools/GraphQLite.Compare` usano il pacchetto `Neo4j.Driver`: la libreria e il server non hanno
+dipendenze esterne.
 
 ## Storage (grafo più grande della RAM)
 
@@ -97,16 +100,25 @@ Un database è una **directory**:
   stessa transazione mette da parte le righe non ancora lette; chiudere il cursore prima della fine ferma una lettura,
   mentre una query di scrittura viene comunque completata. Con `db.Stream` una query di scrittura tiene il turno di
   scrittura finché il cursore non viene chiuso.
+- **Metodi async per le scritture**: `db.ExecuteAsync`, `db.BeginTransactionAsync` e `tx.CommitAsync` aspettano il
+  turno degli altri scrittori e, con `SyncMode.Full`, il fsync del commit **senza bloccare un thread**: con tanti
+  scrittori concorrenti (per esempio un'applicazione ASP.NET) i thread fermi in attesa non esauriscono il thread pool.
+  Con molti commit in attesa dello stesso fsync, è occupato solo il thread che lo esegue. Le query invece girano in
+  modo sincrono, perché sono lavoro di CPU su file mappati in memoria: per questo non esistono versioni async delle
+  letture, e `ExecuteAsync` di una query di sola lettura completa subito.
 - Il **checkpoint** (automatico oltre `CheckpointThresholdBytes`, 256 MB, oppure con `db.Checkpoint()`) copia le versioni più
   recenti nei file mappati, li sincronizza su disco e tronca il WAL. Esclude i lettori solo per il tempo della copia in
   memoria.
 - **WAL a delta**: per ogni pagina si registrano solo gli intervalli di byte cambiati (o l'immagine intera se è cambiata
-  più di metà pagina). I frame hanno CRC32C hardware. In recovery una coda troncata viene scartata. Il replay è
+  più di metà pagina). I frame hanno CRC32C hardware su intestazione e corpo. In recovery una coda troncata o
+  incoerente viene scartata. Il replay è
   idempotente byte per byte, quindi è corretto anche dopo un checkpoint interrotto a metà.
 - `SyncMode`: `Off`, `Normal` (default) oppure `Full`:
   - con `Normal` il commit fa flush verso il sistema operativo. Dopo un power loss si possono perdere gli ultimi commit,
     ma il database non si corrompe, perché i file dati vengono scritti solo dopo il fsync del WAL;
-  - con `Full` ogni commit fa fsync.
+  - con `Full` un commit ritorna solo dopo il fsync del WAL. I commit che arrivano insieme condividono un solo fsync
+    (**group commit**: gli scrittori accodano i frame in memoria e il primo che aspetta li scrive e sincronizza tutti),
+    e gli altri vedono un commit solo quando è durevole.
 - **Atomicità per statement**: una query che fallisce dentro una transazione esplicita viene annullata da sola, e la
   transazione resta utilizzabile.
 - `CALL { … } IN TRANSACTIONS OF n ROWS` committa a lotti, così si importano dataset enormi senza tenere tutto in memoria.
@@ -189,13 +201,18 @@ Le tecniche principali:
 - operatori pull che scrivono in-place su un'unica riga;
 - planner cost-based (index seek per uguaglianza/IN/range/prefisso, seek per `id()`, scan della label più piccola,
   `ExpandInto` sui cicli, Top-N con heap, `shortestPath` con BFS bidirezionale);
-- **aggregazioni parallele**: un'aggregazione sopra una scansione di nodi grande (≥ 16k righe per thread) divide lo
-  spazio degli id in intervalli, li aggrega su più thread e unisce i risultati nell'ordine degli intervalli, quindi il
-  risultato è identico a quello sequenziale (a parte l'arrotondamento delle somme di float). Vale per le transazioni di
+- **query parallele**: sopra una scansione di nodi grande (≥ 16k righe per thread) lo spazio degli id viene diviso in
+  intervalli elaborati su più thread, e i risultati si uniscono nell'ordine degli intervalli, quindi righe e ordine
+  sono identici all'esecuzione sequenziale (a parte l'arrotondamento delle somme di float). Vale per le aggregazioni,
+  per `ORDER BY` (ordinamento o top-N per intervallo, poi fusione) e per le query che restituiscono righe (filtri,
+  espansioni, proiezioni, `DISTINCT`, `SKIP`, `UNION`): lì i worker restano pochi intervalli avanti rispetto a chi legge
+  il risultato, che arriva in streaming, e materializzano già nodi e relazioni restituiti. Vale per le transazioni di
   sola lettura; `DatabaseOptions.MaxDegreeOfParallelism` (default: numero di core, `1` la disattiva);
 - cache dei piani lock-free;
 - lookup delle pagine con tabelle sparse lock-free (due accessi ad array);
-- pool delle pagine da 8 KB: la copy-on-write non passa dall'heap nativo a ogni pagina toccata.
+- pool delle pagine da 8 KB: la copy-on-write non passa dall'heap nativo a ogni pagina toccata;
+- lettori contati su contatori separati per core (ognuno sulla sua cache line): le letture parallele non si contendono
+  una variabile condivisa (+20–30% di lookup a 24 thread rispetto a un contatore unico).
 
 Con le query parallele conviene il **Server GC** (`<ServerGarbageCollection>true</ServerGarbageCollection>` nel
 progetto dell'applicazione): le aggregazioni con molti gruppi allocano da più thread e con il GC workstation vanno
@@ -220,6 +237,33 @@ e l'altra):
 Attraverso il server Bolt, con il driver ufficiale .NET sulla stessa macchina: ~14 k query/s con un client e
 ~115 k query/s con 32 client (lookup e 2-hop). Il limite è il costo del protocollo e del driver: durante la misura il
 server usa circa il 10% della CPU.
+
+### Confronto con Neo4j
+
+Misurato con `tools/GraphQLite.Compare` contro Neo4j 2026.02.2 Enterprise (istanza di Neo4j Desktop con la memoria di
+default, e lo stesso Neo4j embedded in Java), stessi dati e stesse query, tutto su disco, sulla stessa macchina
+(i7-13700, 24 thread). Per gli update i due database fanno fsync a ogni commit (`SyncMode.Full`).
+
+| Operazione | GraphQLite in-process | Neo4j embedded | GraphQLite.Server | Neo4j server |
+|---|---|---|---|---|
+| lookup su indice unique, 1 client | ~780 k/s | ~40 k/s | ~3,6–8 k/s | ~1 k/s |
+| lookup, molti client (24 / 32) | ~3,1 M/s | ~38 k/s | ~25–53 k/s | ~6,5 k/s |
+| 2-hop, 1 client | ~127 k/s | ~32 k/s | ~3,2 k/s | ~1 k/s |
+| 2-hop, molti client | ~750 k/s | ~35 k/s | ~22–24 k/s | ~6,4 k/s |
+| `shortestPath` | ~19 k/s | ~11 k/s | ~2,7 k/s | ~0,8 k/s |
+| scan per label + group by | 5,7 ms | 18 ms | 4,4 ms | 40 ms |
+| espansione di 1M relazioni + filtro | 33 ms | 110 ms | 18–20 ms | 257 ms |
+| grado entrante + top-5 (200k gruppi) | 20–42 ms | 117 ms | 30 ms | 268 ms |
+| update con fsync, 1 client | ~1,8 k/s | ~1,1 k/s | ~1,0 k/s | ~0,5 k/s |
+| update con fsync, molti client | ~13,5–15,5 k/s | ~11–15,5 k/s | ~11,7 k/s | ~5,6 k/s |
+
+- Nelle letture di Neo4j embedded il throughput non cresce con i thread (anche con Community): la causa non è stata
+  indagata, quindi il divario con molti client va preso con cautela.
+- Via Bolt il costo fisso di ogni query pesa di più: un `RETURN 1` costa ~0,28 ms con GraphQLite.Server e ~1,07 ms con
+  Neo4j, con lo stesso driver.
+- Il runtime parallelo di Neo4j Enterprise (`CYPHER runtime=parallel`) migliora le query analitiche via server del
+  10–40%, senza cambiare il quadro.
+- Con il group commit gli update con fsync e molti client in-process sono alla pari.
 
 ## openCypher supportato
 
@@ -300,8 +344,12 @@ dizionari, liste/array, `JsonElement` / `JsonDocument` / `JsonNode`.
 - Le transazioni concorrenti rieseguono le query al commit se nel frattempo altri hanno committato: con molti
   scrittori che toccano gli stessi dati costano più delle esclusive e possono andare in conflitto ripetutamente.
   Gli id dei nodi e delle relazioni delle transazioni annullate o in conflitto non vengono riutilizzati.
-- Le query parallele riguardano solo le aggregazioni sopra una scansione di nodi: le query che restituiscono molte righe
-  senza aggregare, e le transazioni di scrittura, restano su un solo thread.
+- Le query parallele partono solo da una scansione di nodi (per label o di tutti i nodi), non da un index seek, e solo
+  nel piano principale (non dentro `CALL { }` od `OPTIONAL MATCH`). Sotto un `LIMIT` senza `ORDER BY` la scansione resta
+  sequenziale, perché si ferma dopo poche righe. Le transazioni di scrittura restano su un solo thread: ogni riga deve
+  vedere le modifiche delle precedenti, e lo scrittore è uno solo.
+- Restituire molti nodi interi (`RETURN n`) costa soprattutto allocazioni: ogni nodo materializzato ha il suo
+  dizionario delle proprietà.
 - Le date sono limitate agli anni 1–9999 e la precisione temporale è di 100 ns (tick .NET).
 - Gli indici coprono una sola proprietà (niente indici compositi o full-text).
 - Una transazione di scrittura tiene in memoria le pagine che modifica: per import molto grandi usare

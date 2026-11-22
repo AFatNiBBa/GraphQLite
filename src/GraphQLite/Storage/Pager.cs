@@ -231,24 +231,59 @@ internal sealed class PageTable<T>
 /// <item>checkpoint copies the newest versions into the base (memory-mapped files) and truncates the WAL.</item>
 /// </list>
 /// </summary>
+/// <summary>Asynchronous wait of the group commit (<see cref="Pager.WaitDurableAsync"/>): <c>await</c> is not allowed in the unsafe <see cref="Pager"/>.</summary>
+internal static class GroupCommit
+{
+    public static async ValueTask WaitAsync(Pager pager, long seq)
+    {
+        while (!pager.DurableStep(seq, out var running, out long target))
+        {
+            if (running != null) await running.ConfigureAwait(false);
+            else pager.SyncAsLeader(target);
+        }
+    }
+}
+
 internal sealed unsafe class Pager : IDisposable
 {
     public readonly SegmentedSpace[] Spaces;
     private readonly PageTable<PageVersion>[] _overlay = [new(), new(), new()];
     private readonly List<long> _overlayKeys = new();
     private long _committedSeq;
+    private long _visibleSeq;
     private long _overlayBytes;
     private readonly Wal? _wal;
+    /// <summary>SyncMode.Full: commits become visible once fsync'ed, and concurrent commits share one fsync.</summary>
+    private readonly bool _groupSync;
+    private readonly object _syncLock = new();
+    private bool _syncing;
+    /// <summary>Completed when the running fsync ends: what <see cref="WaitDurableAsync"/> waits on (created lazily).</summary>
+    private TaskCompletionSource? _syncDone;
+    private long _syncs;
 
+    /// <summary>Number of group-commit fsyncs so far (tests).</summary>
+    internal long GroupSyncs => Volatile.Read(ref _syncs);
+
+    /// <summary>Test hook: runs on the group-commit leader right before the fsync.</summary>
+    internal Action? BeforeGroupSync;
+
+    /// <summary>Newest commit written to the WAL: what write transactions build on.</summary>
     public long CommittedSeq => Volatile.Read(ref _committedSeq);
+
+    /// <summary>
+    /// Newest commit snapshots may see. Equal to <see cref="CommittedSeq"/>, except with SyncMode.Full where it
+    /// trails it until the WAL is fsync'ed: nobody can read data that a power loss could still take away.
+    /// </summary>
+    public long VisibleSeq => Volatile.Read(ref _visibleSeq);
     public long OverlayBytes => Volatile.Read(ref _overlayBytes);
     public long WalSize => _wal?.Length ?? 0;
     public bool Durable => _wal != null;
 
-    private Pager(SegmentedSpace[] spaces, Wal? wal)
+    private Pager(SegmentedSpace[] spaces, Wal? wal, SyncMode sync = SyncMode.Normal)
     {
         Spaces = spaces;
         _wal = wal;
+        _groupSync = wal != null && sync == SyncMode.Full;
     }
 
     public static Pager InMemory() => new([SegmentedSpace.InMemory(), SegmentedSpace.InMemory(), SegmentedSpace.InMemory()], null);
@@ -270,7 +305,7 @@ internal sealed unsafe class Pager : IDisposable
             opened.Add(nodes);
             var rels = SegmentedSpace.OpenFile(System.IO.Path.Combine(dir, "rels"));
             opened.Add(rels);
-            var pager = new Pager([data, nodes, rels], wal);
+            var pager = new Pager([data, nodes, rels], wal, sync);
             pager.Recover();
             return pager;
         }
@@ -308,7 +343,12 @@ internal sealed unsafe class Pager : IDisposable
         table.Set(page, new PageVersion(seq, (byte*)ptr, older));
     }
 
-    /// <summary>Publishes the dirty pages of a transaction. Caller holds the writer gate.</summary>
+    /// <summary>
+    /// Writes the dirty pages of a transaction to the WAL and publishes them. Caller holds the writer gate.
+    /// With SyncMode.Full the commit is not durable (nor visible to snapshots) yet: the caller must call
+    /// <see cref="WaitDurable"/> with <see cref="CommittedSeq"/>, preferably after releasing the gate so that
+    /// concurrent commits can share the fsync.
+    /// </summary>
     public void Commit(List<(long Key, nint Ptr)> dirty)
     {
         if (dirty.Count == 0) return;
@@ -317,6 +357,84 @@ internal sealed unsafe class Pager : IDisposable
         foreach (var (key, ptr) in dirty) Publish(seq, key, ptr);
         Interlocked.Add(ref _overlayBytes, (long)dirty.Count * Pages.Size);
         Volatile.Write(ref _committedSeq, seq);
+        if (!_groupSync) Volatile.Write(ref _visibleSeq, seq);
+    }
+
+    /// <summary>
+    /// Group commit: returns once commit <paramref name="seq"/> is durable (and visible). The first caller to find
+    /// it pending becomes the leader and fsyncs everything written so far; callers arriving meanwhile wait for it,
+    /// and the next leader covers all of them with a single fsync.
+    /// </summary>
+    public void WaitDurable(long seq)
+    {
+        if (!_groupSync || Volatile.Read(ref _visibleSeq) >= seq) return;
+        while (true)
+        {
+            long target;
+            lock (_syncLock)
+            {
+                while (_syncing && _visibleSeq < seq) Monitor.Wait(_syncLock);
+                if (_visibleSeq >= seq) return;
+                _syncing = true;
+                target = Volatile.Read(ref _committedSeq); // every frame up to here is fully written
+            }
+            SyncAsLeader(target);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="WaitDurable"/> that does not block a thread while another caller's fsync is running: with many
+    /// concurrent committers only the leader's thread is busy (in the fsync itself, which has no asynchronous API).
+    /// </summary>
+    public ValueTask WaitDurableAsync(long seq) =>
+        !_groupSync || Volatile.Read(ref _visibleSeq) >= seq ? ValueTask.CompletedTask : GroupCommit.WaitAsync(this, seq);
+
+    /// <summary>
+    /// One step of <see cref="WaitDurableAsync"/>: true when <paramref name="seq"/> is durable; otherwise either
+    /// <paramref name="running"/> is the fsync in progress to wait for, or the caller became the leader and must call
+    /// <see cref="SyncAsLeader"/> with <paramref name="target"/>.
+    /// </summary>
+    internal bool DurableStep(long seq, out Task? running, out long target)
+    {
+        running = null;
+        target = 0;
+        lock (_syncLock)
+        {
+            if (_visibleSeq >= seq) return true;
+            if (_syncing) running = (_syncDone ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            else
+            {
+                _syncing = true;
+                target = Volatile.Read(ref _committedSeq);
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Fsyncs the WAL up to <paramref name="target"/> and wakes the waiters (caller set <see cref="_syncing"/>).</summary>
+    internal void SyncAsLeader(long target)
+    {
+        bool synced = false;
+        try
+        {
+            BeforeGroupSync?.Invoke();
+            _wal!.Sync();
+            Interlocked.Increment(ref _syncs);
+            synced = true;
+        }
+        finally
+        {
+            TaskCompletionSource? done;
+            lock (_syncLock)
+            {
+                _syncing = false;
+                if (synced && target > _visibleSeq) Volatile.Write(ref _visibleSeq, target);
+                Monitor.PulseAll(_syncLock); // after publishing: woken waiters see the new visible seq
+                done = _syncDone;
+                _syncDone = null;
+            }
+            done?.SetResult(); // asynchronous waiters (they re-check, and one of them may lead the next fsync)
+        }
     }
 
     /// <summary>Copies the newest page versions into the base image and frees the overlay.
@@ -324,7 +442,8 @@ internal sealed unsafe class Pager : IDisposable
     public void MergeOverlay()
     {
         if (_overlayKeys.Count == 0) return;
-        _wal?.Sync();
+        if (_groupSync) WaitDurable(CommittedSeq);
+        else _wal?.Sync();
         foreach (var key in _overlayKeys)
         {
             var space = Spaces[(int)(key >> 56)];
@@ -355,7 +474,7 @@ internal sealed unsafe class Pager : IDisposable
             foreach (var (key, ptr) in pages) Publish(seq, key, ptr);
             last = seq;
         });
-        _committedSeq = last;
+        _committedSeq = _visibleSeq = last;
         if (_overlayKeys.Count > 0)
         {
             MergeOverlay();
@@ -519,28 +638,39 @@ internal sealed unsafe class WriteTx
 /// </summary>
 internal sealed unsafe class Wal : IDisposable
 {
-    private const uint Magic = 0x334C4157; // "WAL3"
+    private const uint Magic = 0x344C4157;   // "WAL4": the CRC covers the whole header except itself
+    private const uint MagicV3 = 0x334C4157; // "WAL3": still replayed (its CRC did not cover the page count)
     private const int HeaderSize = 24;     // magic, page count, seq, crc, body length
     private const ushort FullPage = 0xFFFF;
     private const int MergeGap = 16;
-    private readonly FileStream _fs;
-    private readonly SyncMode _sync;
+    // positional I/O on a raw handle: frames are appended under the writer gate while a group-commit leader may be
+    // fsyncing from another thread, which a FileStream (with its own position and buffer) would not allow
+    private readonly Microsoft.Win32.SafeHandles.SafeFileHandle _file;
+    private long _end;
+    /// <summary>
+    /// SyncMode.Full: committed frames wait here (in memory) for the group-commit leader, which writes all of them
+    /// with one write and one fsync. Writers never touch the file while an fsync runs (on Windows a flush blocks
+    /// concurrent writes to the file, which would serialize the commits again).
+    /// </summary>
+    private readonly bool _deferred;
+    private BinWriter _pending = new(1 << 16), _flushing = new(1 << 16);
+    private readonly object _pendingLock = new();
     private readonly BinWriter _body = new(1 << 16);
 
-    private Wal(FileStream fs, SyncMode sync)
+    private Wal(Microsoft.Win32.SafeHandles.SafeFileHandle file, SyncMode sync)
     {
-        _fs = fs;
-        _sync = sync;
+        _file = file;
+        _deferred = sync == SyncMode.Full;
+        _end = RandomAccess.GetLength(file);
     }
 
-    public long Length => _fs.Length;
+    public long Length => Volatile.Read(ref _end);
 
     public static Wal Open(string path, SyncMode sync)
     {
         try
         {
-            var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1 << 16);
-            return new Wal(fs, sync);
+            return new Wal(File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None), sync);
         }
         catch (IOException ex)
         {
@@ -608,23 +738,42 @@ internal sealed unsafe class Wal : IDisposable
         BinaryPrimitives.WriteInt32LittleEndian(header[4..], pages.Count);
         BinaryPrimitives.WriteInt64LittleEndian(header[8..], seq);
         BinaryPrimitives.WriteInt32LittleEndian(header[20..], w.Length);
-        uint crc = CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8));
-        crc = CrcStream.Update(crc, header.Slice(20, 4));
-        crc = CrcStream.Update(crc, w.Written);
-        BinaryPrimitives.WriteUInt32LittleEndian(header[16..], ~crc);
-        long pos = _fs.Position;
+        BinaryPrimitives.WriteUInt32LittleEndian(header[16..], FrameCrc(header, w.Written, Magic));
+        if (_deferred)
+        {
+            // written and fsync'ed by the group commit (Sync, called by Pager.WaitDurable outside the writer gate)
+            lock (_pendingLock)
+            {
+                _pending.WriteBytes(header);
+                _pending.WriteBytes(w.Written);
+            }
+            if (w.Length > 1 << 22) _body.Reset();
+            return;
+        }
+        // written straight to the OS: survives a process crash
+        long pos = _end;
         try
         {
-            _fs.Write(header);
-            _fs.Write(w.Written);
-            if (_sync != SyncMode.Off) _fs.Flush(_sync == SyncMode.Full);
+            RandomAccess.Write(_file, header, pos);
+            RandomAccess.Write(_file, w.Written, pos + HeaderSize);
         }
         catch
         {
-            try { _fs.SetLength(pos); _fs.Position = pos; } catch { }
+            try { RandomAccess.SetLength(_file, pos); } catch { }
             throw;
         }
+        Volatile.Write(ref _end, pos + HeaderSize + w.Length);
         if (w.Length > 1 << 22) _body.Reset();
+    }
+
+    /// <summary>CRC32C of a frame: header fields after the magic (except the CRC itself) and body.</summary>
+    private static uint FrameCrc(ReadOnlySpan<byte> header, ReadOnlySpan<byte> body, uint magic)
+    {
+        uint crc = magic == MagicV3
+            ? CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8))
+            : CrcStream.Update(0xFFFFFFFFu, header.Slice(4, 12));
+        crc = CrcStream.Update(crc, header.Slice(20, 4));
+        return ~CrcStream.Update(crc, body);
     }
 
     private static void BinaryPrimitivesWriteU16(BinWriter w, ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(w.Reserve(2), v);
@@ -632,26 +781,23 @@ internal sealed unsafe class Wal : IDisposable
     /// <summary>Replays valid frames; <paramref name="current"/> returns the latest image of a page (recovered so far or base).</summary>
     public void Recover(Func<long, nint> current, Action<long, List<(long Key, nint Ptr)>> apply)
     {
-        _fs.Position = 0;
-        long good = 0, len = _fs.Length;
+        long good = 0, len = RandomAccess.GetLength(_file);
         Span<byte> header = stackalloc byte[HeaderSize];
         byte[] body = [];
         while (good + HeaderSize <= len)
         {
-            _fs.Position = good;
-            if (_fs.Read(header) != HeaderSize) break;
-            if (BinaryPrimitives.ReadUInt32LittleEndian(header) != Magic) break;
+            if (RandomAccess.Read(_file, header, good) != HeaderSize) break;
+            uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header);
+            if (magic != Magic && magic != MagicV3) break;
             int count = BinaryPrimitives.ReadInt32LittleEndian(header[4..]);
             long seq = BinaryPrimitives.ReadInt64LittleEndian(header[8..]);
             uint crc = BinaryPrimitives.ReadUInt32LittleEndian(header[16..]);
             int bodyLen = BinaryPrimitives.ReadInt32LittleEndian(header[20..]);
             if (count <= 0 || bodyLen < 0 || good + HeaderSize + bodyLen > len) break;
             if (body.Length < bodyLen) body = new byte[bodyLen];
-            _fs.ReadExactly(body, 0, bodyLen);
-            uint state = CrcStream.Update(0xFFFFFFFFu, header.Slice(8, 8));
-            state = CrcStream.Update(state, header.Slice(20, 4));
-            state = CrcStream.Update(state, body.AsSpan(0, bodyLen));
-            if (~state != crc) break;
+            if (RandomAccess.Read(_file, body.AsSpan(0, bodyLen), good + HeaderSize) != bodyLen) break;
+            if (FrameCrc(header, body.AsSpan(0, bodyLen), magic) != crc) break;
+            if (!Validate(body.AsSpan(0, bodyLen), count)) break; // inconsistent frame: treated as a torn tail
             var pages = new List<(long, nint)>(count);
             int p = 0;
             for (int i = 0; i < count; i++)
@@ -684,23 +830,74 @@ internal sealed unsafe class Wal : IDisposable
         }
         if (good != len)
         {
-            _fs.SetLength(good);
-            _fs.Flush(true);
+            RandomAccess.SetLength(_file, good);
+            RandomAccess.FlushToDisk(_file);
         }
-        _fs.Position = good;
+        _end = good;
     }
 
+    /// <summary>Checks that a frame body holds exactly <paramref name="count"/> well-formed page records.</summary>
+    private static bool Validate(ReadOnlySpan<byte> body, int count)
+    {
+        int p = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (body.Length - p < 10) return false;
+            long key = BinaryPrimitives.ReadInt64LittleEndian(body[p..]);
+            ushort n = BinaryPrimitives.ReadUInt16LittleEndian(body[(p + 8)..]);
+            p += 10;
+            if (key < 0 || (key >> 56) > (long)Space.Rels) return false;
+            if (n == FullPage)
+            {
+                if (body.Length - p < Pages.Size) return false;
+                p += Pages.Size;
+                continue;
+            }
+            for (int k = 0; k < n; k++)
+            {
+                if (body.Length - p < 4) return false;
+                int off = BinaryPrimitives.ReadUInt16LittleEndian(body[p..]);
+                int l = BinaryPrimitives.ReadUInt16LittleEndian(body[(p + 2)..]);
+                p += 4;
+                if (off + l > Pages.Size || body.Length - p < l) return false;
+                p += l;
+            }
+        }
+        return p == body.Length;
+    }
+
+    /// <summary>Makes every appended frame durable. Not reentrant: callers serialize it (group-commit leader).</summary>
     public void Sync()
     {
-        if (_fs.Length > 0) _fs.Flush(true);
+        if (_deferred)
+        {
+            lock (_pendingLock) (_pending, _flushing) = (_flushing, _pending);
+            var batch = _flushing;
+            if (batch.Length > 0)
+            {
+                long pos = _end;
+                try
+                {
+                    RandomAccess.Write(_file, batch.Written, pos);
+                }
+                catch
+                {
+                    try { RandomAccess.SetLength(_file, pos); } catch { }
+                    throw;
+                }
+                Volatile.Write(ref _end, pos + batch.Length);
+                batch.Reset();
+            }
+        }
+        if (Volatile.Read(ref _end) > 0) RandomAccess.FlushToDisk(_file);
     }
 
     public void Truncate()
     {
-        _fs.SetLength(0);
-        _fs.Position = 0;
-        _fs.Flush(true);
+        RandomAccess.SetLength(_file, 0);
+        Volatile.Write(ref _end, 0);
+        RandomAccess.FlushToDisk(_file);
     }
 
-    public void Dispose() => _fs.Dispose();
+    public void Dispose() => _file.Dispose();
 }

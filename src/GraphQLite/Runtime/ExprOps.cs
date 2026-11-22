@@ -337,7 +337,7 @@ internal static class ExprOps
     }
 
     /// <summary>Evaluates a label expression (AND / OR / NOT of labels, % wildcard) on a node.</summary>
-    public static Value LabelExpr(ExecContext ctx, in Value target, Cypher.LabelExpression expr)
+    public static Value LabelExpr(ExecContext ctx, in Value target, LabelMatcher expr)
     {
         if (target.IsNull) return Value.Null;
         if (target.Kind != ValueKind.Node) throw new CypherRuntimeException($"Label check requires a node, got {target.Kind}");

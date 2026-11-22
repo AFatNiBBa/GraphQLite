@@ -7,12 +7,13 @@ namespace GraphQLite;
 /// <summary>Durability of commits (same meaning as SQLite's PRAGMA synchronous in WAL mode).</summary>
 public enum SyncMode
 {
-    /// <summary>The WAL is not flushed on commit: fastest, recent commits may be lost if the process crashes.</summary>
+    /// <summary>Same as <see cref="Normal"/> (the WAL is written straight to the OS): kept for compatibility.</summary>
     Off,
-    /// <summary>The WAL is flushed to the OS on commit: survives process crashes; a power loss may lose recent commits
+    /// <summary>The WAL is written to the OS on commit: survives process crashes; a power loss may lose recent commits
     /// but never corrupts the database (data files are only written after the WAL is fsync'ed).</summary>
     Normal,
-    /// <summary>The WAL is fsync'ed on every commit: committed transactions survive power loss.</summary>
+    /// <summary>A commit returns once the WAL is fsync'ed: committed transactions survive power loss. Commits that
+    /// arrive together share one fsync (group commit), and other transactions see a commit only once it is durable.</summary>
     Full,
 }
 
@@ -97,9 +98,27 @@ public sealed class GraphDatabase : IDisposable
     {
         ThrowIfDisposed();
         WriterGate.Wait(cancellationToken);
+        return StartWrite(autoCommit: false);
+    }
+
+    /// <summary>
+    /// <see cref="BeginTransaction"/> that waits for the other writers without blocking the thread: with many
+    /// concurrent writers (e.g. a web application) blocked threads could starve the thread pool. Commit it with
+    /// <see cref="Transaction.CommitAsync"/>; its queries run synchronously.
+    /// </summary>
+    public async ValueTask<Transaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        await WriterGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return StartWrite(autoCommit: false);
+    }
+
+    /// <summary>Starts an exclusive write transaction; the caller acquired the writer gate.</summary>
+    private Transaction StartWrite(bool autoCommit)
+    {
         try
         {
-            return new Transaction(this, Store.BeginWrite(), autoCommit: false);
+            return new Transaction(this, Store.BeginWrite(), autoCommit);
         }
         catch
         {
@@ -156,8 +175,7 @@ public sealed class GraphDatabase : IDisposable
         {
             ThrowIfDisposed();
             WriterGate.Wait(cancellationToken);
-            try { tx = new Transaction(this, Store.BeginWrite(), autoCommit: true); }
-            catch { WriterGate.Release(); throw; }
+            tx = StartWrite(autoCommit: true);
         }
         else tx = BeginReadTransaction();
         using (tx)
@@ -166,6 +184,26 @@ public sealed class GraphDatabase : IDisposable
             tx.Commit();
             return result;
         }
+    }
+
+    /// <summary>
+    /// <see cref="Execute"/> that does not block the thread while an updating query waits for the other writers and,
+    /// with <see cref="SyncMode.Full"/>, for the fsync of its commit. The query itself runs synchronously (it is CPU
+    /// work on memory-mapped files), and read-only queries complete synchronously: they never wait for anybody.
+    /// </summary>
+    public ValueTask<QueryResult> ExecuteAsync(string query, IReadOnlyDictionary<string, object?>? parameters = null, CancellationToken cancellationToken = default) =>
+        GetStatement(query).IsWrite
+            ? ExecuteWriteAsync(query, parameters, cancellationToken)
+            : ValueTask.FromResult(Execute(query, parameters, cancellationToken));
+
+    private async ValueTask<QueryResult> ExecuteWriteAsync(string query, IReadOnlyDictionary<string, object?>? parameters, CancellationToken cancellationToken)
+    {
+        ThrowIfDisposed();
+        await WriterGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        using var tx = StartWrite(autoCommit: true);
+        var result = tx.Execute(query, parameters, cancellationToken);
+        await tx.CommitAsync().ConfigureAwait(false);
+        return result;
     }
 
     /// <summary>
@@ -181,8 +219,7 @@ public sealed class GraphDatabase : IDisposable
         {
             ThrowIfDisposed();
             WriterGate.Wait(cancellationToken);
-            try { tx = new Transaction(this, Store.BeginWrite(), autoCommit: true); }
-            catch { WriterGate.Release(); throw; }
+            tx = StartWrite(autoCommit: true);
         }
         else tx = BeginReadTransaction();
         try

@@ -8,6 +8,7 @@ TestResults/
 
 # GraphQLite
 .data/
+tools/GraphQLite.Compare/neo4j-embedded/out/
 *.gdb
 *.gdb-wal
 *.gdb-tmp

@@ -71,9 +71,28 @@ internal sealed partial class Planner
         return (new UnionOp(branches.ToArray(), unionSlots!, !all), unionCols!, unionSlots!);
     }
 
+    /// <summary>
+    /// Runs on several threads the chains of row-local operators over a partitioned scan that produce the result of
+    /// a read query (<see cref="GatherOp"/>). Aggregations and sorts parallelize their own input; below a LIMIT the
+    /// sequential scan stops after a few rows, while workers would compute whole ranges.
+    /// </summary>
+    /// <param name="output">Slots of the result columns: the workers also materialize the entities there.</param>
+    private static Operator Parallelize(Operator op, int[] output)
+    {
+        if (Partitioning.FindLeaf(op) is { } leaf) return new GatherOp(op, leaf, output);
+        if (op is UnionOp union) return union.WithBranches(union.Children.Select(b => Parallelize(b, output)).ToArray());
+        if (op is UnaryOperator u and not LimitOp)
+        {
+            var input = Parallelize(u.Input, output);
+            if (!ReferenceEquals(input, u.Input) && u.WithInput(input) is { } rewritten) return rewritten;
+        }
+        return op;
+    }
+
     private PlannedQuery PlanQuery(QueryStatement q)
     {
         var (root, columns, slots) = PlanBody(q, null);
+        if (!_isWrite) root = Parallelize(root, slots);
         var names = new string[_params.Count];
         foreach (var kv in _params) names[kv.Value] = kv.Key;
         return new PlannedQuery
@@ -412,7 +431,19 @@ internal sealed partial class Planner
             if (proj.OrderBy != null)
                 foreach (var s in proj.OrderBy) AddAggregates(s.Expr);
 
-            op = new AggregateOp(op, keySlots.ToArray(), keyEvals.ToArray(), aggs.ToArray());
+            // slots the grouping keys depend on, when the keys are deterministic (see AggregateOp._keyDeps)
+            int[]? keyDeps = null;
+            var keyExprs = items.Select(it => it.Expr).Where(e => !ContainsAggregate(e)).ToList();
+            if (!keyExprs.Any(IsRandom))
+                keyDeps = keyExprs.SelectMany(FreeVars)
+                    .Where(scope.ContainsKey)
+                    .Select(v => scope[v])
+                    .Distinct()
+                    .ToArray();
+            // the expressions computed after the aggregation can read the input variables that are not grouping keys
+            // (from the first row of the group): only then the groups keep a snapshot of that row
+            bool snapshot = postItems.Any(p => FreeVarsOutsideAggregates(p.Expr).Any(v => scope.ContainsKey(v) && !newScope.ContainsKey(v)));
+            op = new AggregateOp(op, keySlots.ToArray(), keyEvals.ToArray(), aggs.ToArray(), snapshot, keyDeps);
             _readsSinceBarrier = false;
             _varExpandSinceBarrier = false;
             _writesSinceBarrier = false;

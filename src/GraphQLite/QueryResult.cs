@@ -199,6 +199,7 @@ public sealed class QueryResult : IReadOnlyList<Record>
                 case ValueKind.Path:
                     {
                         var p = (GraphPath)v.Obj!;
+                        if (p.MaterializedNodes != null) return v;
                         return Value.FromPath(new GraphPath(p.NodeIds, p.RelIds, p.NodeIds.Select(GetNode).ToArray(), p.RelIds.Select(GetRel).ToArray()));
                     }
                 case ValueKind.List:
@@ -226,9 +227,16 @@ public sealed class QueryResult : IReadOnlyList<Record>
             }
         }
 
-        private static bool NeedsWork(Value v) =>
-            v.Kind is ValueKind.Node or ValueKind.Relationship or ValueKind.Path || v.Kind == ValueKind.List && v.ListItems.Any(NeedsWork) ||
-            v.Kind == ValueKind.Map && v.MapItems.Values.Any(NeedsWork);
+        /// <summary>False for values without entities and for values already materialized (for example by a parallel worker).</summary>
+        private static bool NeedsWork(Value v) => v.Kind switch
+        {
+            ValueKind.Node => v.Obj is not Node,
+            ValueKind.Relationship => v.Obj is not Relationship,
+            ValueKind.Path => ((GraphPath)v.Obj!).MaterializedNodes is null,
+            ValueKind.List => v.ListItems.Any(NeedsWork),
+            ValueKind.Map => v.MapItems.Values.Any(NeedsWork),
+            _ => false,
+        };
 
         private Node GetNode(long id)
         {

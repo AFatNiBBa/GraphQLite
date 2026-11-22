@@ -85,7 +85,11 @@ internal sealed partial class Planner
             case LabelCheckExpr lc:
                 {
                     var t = Compile(lc.Target, s);
-                    if (lc.Expression is { } lexpr) return ctx => ExprOps.LabelExpr(ctx, t(ctx), lexpr);
+                    if (lc.Expression is { } lexpr)
+                    {
+                        var matcher = LabelMatcher.Compile(lexpr);
+                        return ctx => ExprOps.LabelExpr(ctx, t(ctx), matcher);
+                    }
                     var labels = lc.Labels.Select(l => new TokenRef(l, TokenKind.Label)).ToArray();
                     return ctx => ExprOps.HasLabels(ctx, t(ctx), labels);
                 }
@@ -423,6 +427,13 @@ internal sealed partial class Planner
         return l.Count > 0;
     }
 
+    /// <summary>
+    /// True when the expression may give different results for the same variables: random functions, and pattern
+    /// subqueries (not analysed: treated as such).
+    /// </summary>
+    public static bool IsRandom(Expr e) =>
+        e is FuncExpr { Name: "rand" or "randomuuid" } or PatternSubqueryExpr || AllChildren(e).Any(IsRandom);
+
     private static IEnumerable<Expr> AllChildren(Expr e)
     {
         switch (e)
@@ -460,8 +471,17 @@ internal sealed partial class Planner
         return acc;
     }
 
-    private static void FreeVars(Expr e, HashSet<string> bound, HashSet<string> acc)
+    /// <summary>Free variables read outside the aggregate calls of an expression (after the aggregation).</summary>
+    public static HashSet<string> FreeVarsOutsideAggregates(Expr e)
     {
+        var acc = new HashSet<string>();
+        FreeVars(e, [], acc, true);
+        return acc;
+    }
+
+    private static void FreeVars(Expr e, HashSet<string> bound, HashSet<string> acc, bool skipAggregates = false)
+    {
+        if (skipAggregates && IsAggregate(e)) return;
         switch (e)
         {
             case VarExpr v:
@@ -469,30 +489,30 @@ internal sealed partial class Planner
                 return;
             case ListCompExpr lc:
                 {
-                    FreeVars(lc.List, bound, acc);
+                    FreeVars(lc.List, bound, acc, skipAggregates);
                     var b2 = new HashSet<string>(bound) { lc.Variable };
-                    if (lc.Where != null) FreeVars(lc.Where, b2, acc);
-                    if (lc.Map != null) FreeVars(lc.Map, b2, acc);
+                    if (lc.Where != null) FreeVars(lc.Where, b2, acc, skipAggregates);
+                    if (lc.Map != null) FreeVars(lc.Map, b2, acc, skipAggregates);
                     return;
                 }
             case QuantifierExpr q:
                 {
-                    FreeVars(q.List, bound, acc);
-                    FreeVars(q.Where, new HashSet<string>(bound) { q.Variable }, acc);
+                    FreeVars(q.List, bound, acc, skipAggregates);
+                    FreeVars(q.Where, new HashSet<string>(bound) { q.Variable }, acc, skipAggregates);
                     return;
                 }
             case ReduceExpr r:
                 {
-                    FreeVars(r.Init, bound, acc);
-                    FreeVars(r.List, bound, acc);
-                    FreeVars(r.Body, new HashSet<string>(bound) { r.Acc, r.Variable }, acc);
+                    FreeVars(r.Init, bound, acc, skipAggregates);
+                    FreeVars(r.List, bound, acc, skipAggregates);
+                    FreeVars(r.Body, new HashSet<string>(bound) { r.Acc, r.Variable }, acc, skipAggregates);
                     return;
                 }
             case MapProjectionExpr mp:
                 if (!bound.Contains(mp.Variable)) acc.Add(mp.Variable);
                 foreach (var it in mp.Items)
                 {
-                    if (it.Value != null) FreeVars(it.Value, bound, acc);
+                    if (it.Value != null) FreeVars(it.Value, bound, acc, skipAggregates);
                     if (it.Kind == MapProjKind.Variable && !bound.Contains(it.Key)) acc.Add(it.Key);
                 }
                 return;
@@ -503,19 +523,19 @@ internal sealed partial class Planner
                     foreach (var n in part.Nodes)
                     {
                         if (n.Variable != null && !bound.Contains(n.Variable)) acc.Add(n.Variable);
-                        if (n.Props != null) FreeVars(n.Props, bound, acc);
+                        if (n.Props != null) FreeVars(n.Props, bound, acc, skipAggregates);
                     }
                     foreach (var r in part.Rels)
                     {
                         if (r.Variable != null && !bound.Contains(r.Variable)) acc.Add(r.Variable);
-                        if (r.Props != null) FreeVars(r.Props, bound, acc);
+                        if (r.Props != null) FreeVars(r.Props, bound, acc, skipAggregates);
                     }
                 }
-                if (ps.Where != null) FreeVars(ps.Where, bound, acc);
-                if (ps.Map != null) FreeVars(ps.Map, bound, acc);
+                if (ps.Where != null) FreeVars(ps.Where, bound, acc, skipAggregates);
+                if (ps.Map != null) FreeVars(ps.Map, bound, acc, skipAggregates);
                 return;
             default:
-                foreach (var c in e.Children) FreeVars(c, bound, acc);
+                foreach (var c in e.Children) FreeVars(c, bound, acc, skipAggregates);
                 return;
         }
     }
